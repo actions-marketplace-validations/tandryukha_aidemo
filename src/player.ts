@@ -1907,7 +1907,26 @@ async function boxOf(page: Page, loc: Locator): Promise<{ cx: number; cy: number
   for (let i = 0; i < 3 && box && vp; i++) {
     const cy = box.y + box.height / 2;
     if (cy >= 80 && cy <= vp.height - 120) break;
-    await easedWheel(page, cy - vp.height * 0.55, { durationMs: 500 });
+    const dy = cy - vp.height * 0.55;
+    // A sticky/fixed element (a header chip) never moves with the scroller,
+    // and a page already at its top/bottom cannot scroll that way — wheeling
+    // anyway only rubber-bands the whole page (a 1 Hz ~6 px bob on the take,
+    // three bounces per hover/click on a header target; loyalty v7 take 1).
+    const canNudge = await loc
+      .evaluate((el, d) => {
+        let n: Element | null = el;
+        while (n && n !== document.body) {
+          const pos = getComputedStyle(n).position;
+          if (pos === "fixed" || pos === "sticky") return false;
+          n = n.parentElement;
+        }
+        const se = document.scrollingElement ?? document.documentElement;
+        const max = se.scrollHeight - se.clientHeight;
+        return d < 0 ? se.scrollTop > 0 : se.scrollTop < max - 1;
+      }, dy)
+      .catch(() => true);
+    if (!canNudge) break;
+    await easedWheel(page, dy, { durationMs: 500 });
     box = await loc.boundingBox();
   }
   if (!box) throw new Error("Element has no bounding box (not visible?)");
