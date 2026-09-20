@@ -6,12 +6,13 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { ENGINE_ROOT, engineVersion, captionsAutoOffline } from "../config.js";
 import { Project, parseStoryboard } from "../project.js";
-import { StoryboardSchema } from "../types.js";
+import { StoryboardSchema, SeedCookieSchema, type SeedCookie, type Storyboard } from "../types.js";
 import { generateVoice } from "../voice.js";
 import { record, type RecordOptions } from "../recorder.js";
 import {
   buildProbeGolden,
   diffGolden,
+  driftFilesForDiff,
   readProbeGolden,
   writeProbeGolden,
 } from "../golden.js";
@@ -21,9 +22,15 @@ import { compose } from "../compose.js";
 import { exportGif } from "../gif.js";
 import { buildEmbed } from "../embed.js";
 import { extractStills, storyboardHasStills } from "../stills.js";
+import { extractFrames } from "../frames.js";
+import { inspectPage } from "../inspect.js";
+import { importTrace, scaffoldImported } from "../import-trace.js";
+import { exportWalkthrough } from "../walkthrough.js";
+import { GUIDE_TOPIC_NAMES, guideHeadings, guidePath as guideFilePath, sliceGuide } from "../guide.js";
+import { lintStoryboard, logLint } from "../lint.js";
 import { localizeStoryboard } from "../i18n.js";
 import { scaffoldDemo, doctorReport, buildFeedback, fileFeedback } from "../distribute.js";
-import { readJson, log, CanceledError, type SceneProgress } from "../util.js";
+import { readJson, writeJson, log, CanceledError, type SceneProgress } from "../util.js";
 import { JobManager, JobBusyError, type Job, type JobKind } from "./jobs.js";
 
 /**
@@ -116,6 +123,16 @@ const DIR_INPUT = z
  * placeholders resolve to these values (else the declared default) across all
  * stages of the run.
  */
+/** Output shape of one lint finding (src/lint.ts LintIssue). */
+const LINT_ISSUE_SHAPE = z.object({
+  severity: z.enum(["error", "warn", "info"]),
+  code: z.string(),
+  scene: z.string().optional(),
+  action: z.number().optional(),
+  message: z.string(),
+  fix: z.string().optional(),
+});
+
 const PARAMS_INPUT = z
   .record(z.string(), z.string())
   .optional()
@@ -148,7 +165,46 @@ const RECORD_INPUT_SHAPE = {
     .string()
     .optional()
     .describe("Chrome user-data dir (logged-in profile)"),
+  fresh: z
+    .boolean()
+    .optional()
+    .describe(
+      "run against a WIPED throwaway profile — use for any demo whose story " +
+        "starts at a first-run gate, onboarding, an empty state or a one-shot " +
+        "flow, since carried-over cookies/localStorage silently record the " +
+        "wrong story. Not for logged-in demos (a fresh profile has no login)."
+    ),
   capture: z.enum(["playwright", "native", "obs"]).optional(),
+  fromScene: z
+    .string()
+    .optional()
+    .describe(
+      "resume: keep the previous take's scenes before this scene id (footage + " +
+        "timeline, verified unchanged by hash) and record from it — after a " +
+        "late-scene failure or a change to the tail of the storyboard"
+    ),
+  storageState: z
+    .string()
+    .optional()
+    .describe(
+      "absolute path to a Playwright storageState JSON (cookies + per-origin " +
+        "localStorage) to seed into the profile before the first action — for " +
+        "cookie-gated sites. Also available as storyboard setup.storageState."
+    ),
+  cookies: z
+    .array(SeedCookieSchema)
+    .optional()
+    .describe(
+      "cookies to seed before the first action (name, value, domain[, path, " +
+        "secure, httpOnly, sameSite, expires]). Also storyboard setup.cookies."
+    ),
+  profileSeeded: z
+    .boolean()
+    .optional()
+    .describe(
+      "the profile is seeded on purpose (login / cookie gate): silence the " +
+        "carried-over-state warning. Implied by storageState/cookies."
+    ),
   params: PARAMS_INPUT,
 };
 
@@ -179,7 +235,7 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
       .catch(() => {});
   };
 
-  const guidePath = resolve(ENGINE_ROOT, "docs", "AUTHORING.md");
+  const guidePath = guideFilePath();
 
   server.registerTool(
     "get_authoring_guide",
@@ -188,16 +244,51 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
       description:
         "The canonical guide to authoring demos: storyboard schema, action " +
         "vocabulary, demo-director principles, ChatGPT-app recording facts. " +
-        "Call this FIRST before authoring or editing a storyboard.",
-      inputSchema: {},
-      outputSchema: { guide: z.string(), engineVersion: z.string() },
+        "Call this FIRST before authoring or editing a storyboard. Pass " +
+        `\`topic\` (${GUIDE_TOPIC_NAMES.join(" | ")}, or any H2 heading prefix) ` +
+        "for one slice instead of the whole ~1000-line guide; start with " +
+        "`core`, then fetch `attention`/`polish`/`chatgpt-apps` as needed.",
+      inputSchema: {
+        topic: z
+          .string()
+          .optional()
+          .describe(
+            `Slice: ${GUIDE_TOPIC_NAMES.join(", ")} — or an H2 heading prefix. Omit for the full guide.`
+          ),
+      },
+      outputSchema: {
+        guide: z.string(),
+        engineVersion: z.string(),
+        topic: z.string().optional(),
+        topics: z.array(z.string()),
+        sections: z.array(z.string()),
+      },
       annotations: { readOnlyHint: true },
     },
-    async () =>
-      jsonResult({
-        guide: await readFile(guidePath, "utf8"),
+    async ({ topic }) => {
+      const md = await readFile(guidePath, "utf8");
+      const sections = guideHeadings(md);
+      if (!topic) {
+        return jsonResult({ guide: md, engineVersion: engineVersion(), topics: GUIDE_TOPIC_NAMES, sections });
+      }
+      const slice = sliceGuide(md, topic);
+      if (slice == null) {
+        return errorResult({
+          message:
+            `Unknown guide topic "${topic}". Topics: ${GUIDE_TOPIC_NAMES.join(", ")}; ` +
+            `or an H2 heading prefix: ${sections.join(" · ")}`,
+          topics: GUIDE_TOPIC_NAMES,
+          sections,
+        });
+      }
+      return jsonResult({
+        guide: slice,
         engineVersion: engineVersion(),
-      })
+        topic,
+        topics: GUIDE_TOPIC_NAMES,
+        sections,
+      });
+    }
   );
 
   server.registerTool(
@@ -242,6 +333,7 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
           z.object({ path: z.string(), message: z.string(), code: z.string() })
         ),
         warnings: z.array(z.string()),
+        lint: z.array(LINT_ISSUE_SHAPE).optional(),
       },
       annotations: { readOnlyHint: true },
     },
@@ -300,7 +392,78 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
         sceneCount: parsed.storyboard.scenes.length,
         issues: [],
         warnings: parsed.warnings,
+        lint: lintStoryboard(parsed.storyboard).issues,
       });
+    }
+  );
+
+  server.registerTool(
+    "lint_storyboard",
+    {
+      title: "Lint a storyboard (preflight, no browser)",
+      description:
+        "Browser-free preflight over a storyboard: a per-scene pacing forecast " +
+        "(which scenes compose will mostly freeze-hold or cut because the " +
+        "narration and the recorded action don't match), selector/wait " +
+        "pitfalls (type+Enter with no wait, :text-is on nested labels, focus " +
+        "without a zoom block, anchored waitForChange regexes), and no-op keys. " +
+        "Run it after every storyboard edit, before probe/render. Pass exactly " +
+        "one of dir / path / json. lang lints a narrations[lang] translation at " +
+        "that language's speaking rate.",
+      inputSchema: {
+        dir: z.string().optional().describe("demo dir → generated/storyboard.json"),
+        path: z.string().optional().describe("path to a storyboard .json file"),
+        json: z.string().optional().describe("storyboard JSON as a string"),
+        lang: z.string().optional(),
+        params: PARAMS_INPUT,
+      },
+      outputSchema: {
+        issues: z.array(LINT_ISSUE_SHAPE),
+        estimate: z.array(
+          z.object({
+            id: z.string(),
+            words: z.number(),
+            narrationMs: z.number(),
+            actionMs: z.number(),
+            holdPct: z.number(),
+            overrunMs: z.number(),
+          })
+        ),
+        narrationTotalMs: z.number(),
+        wordsPerSec: z.number(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async (args) => {
+      const sources = [args.dir, args.path, args.json].filter((s) => s != null).length;
+      if (sources !== 1) {
+        return errorResult({ message: "pass exactly one of: dir, path, json" });
+      }
+      let raw: unknown;
+      try {
+        raw =
+          args.json != null
+            ? JSON.parse(args.json)
+            : await readJson<unknown>(
+                args.path != null
+                  ? resolve(args.path)
+                  : new Project(args.dir as string).storyboardPath
+              );
+      } catch (err) {
+        return errorResult({ message: (err as Error).message });
+      }
+      const parsed = parseStoryboard(raw, {
+        relaxed: true,
+        params: args.params,
+        strict: args.params != null,
+      });
+      if (!parsed.ok) {
+        return errorResult({
+          message: "storyboard fails schema validation — run validate_storyboard",
+          issues: parsed.issues,
+        });
+      }
+      return jsonResult({ ...lintStoryboard(parsed.storyboard, { lang: args.lang }) });
     }
   );
 
@@ -310,11 +473,21 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
       title: "Scaffold a new demo",
       description:
         "Create demos/<name>/ with a starter brief + storyboard. dir is the " +
-        "repo to scaffold into (absolute path recommended; default: server cwd).",
+        "repo to scaffold into (absolute path recommended; default: server cwd). " +
+        "With fromUrl the page is inspected first (no LLM): its headings become " +
+        "scenes and its unique selectors become the beats + a `_candidates` list — " +
+        "you then write the narration and turn the candidate hover into the real click.",
       inputSchema: {
         name: z.string().describe("demo name (creates demos/<name>/)"),
         dir: z.string().optional(),
         force: z.boolean().optional(),
+        fromUrl: z.string().optional().describe("draft the storyboard from this live page"),
+        headless: z.boolean().optional().describe("fromUrl: run Chrome headless (default true)"),
+        profile: z.string().optional().describe("fromUrl: Chrome user-data dir (logged-in pages)"),
+        viewport: z
+          .object({ width: z.number(), height: z.number() })
+          .optional()
+          .describe("fromUrl: viewport (default 1280x720)"),
       },
       outputSchema: {
         demoDir: z.string(),
@@ -326,7 +499,13 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
       const demoDir = await scaffoldDemo(
         args.dir ? resolve(args.dir) : process.cwd(),
         args.name,
-        { force: args.force }
+        {
+          force: args.force,
+          fromUrl: args.fromUrl,
+          headed: args.headless === false,
+          profileDir: args.profile,
+          viewport: args.viewport,
+        }
       );
       const project = new Project(demoDir);
       return jsonResult({
@@ -631,13 +810,29 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
 
   /** Record options wired to a job's progress fields + abort signal. */
   function recordOpts(
-    args: { headless?: boolean; profile?: string; capture?: "playwright" | "native" | "obs" },
-    job: Job
+    args: {
+      headless?: boolean;
+      profile?: string;
+      fresh?: boolean;
+      capture?: "playwright" | "native" | "obs";
+      storageState?: string;
+      cookies?: SeedCookie[];
+      profileSeeded?: boolean;
+      fromScene?: string;
+    },
+    job: Job,
+    reloadStoryboard?: () => Promise<Storyboard>
   ): RecordOptions {
     return {
       profileDir: args.profile,
+      fresh: args.fresh,
+      storageState: args.storageState,
+      cookies: args.cookies,
+      profileSeeded: args.profileSeeded,
+      reloadStoryboard,
       headed: !args.headless,
       capture: args.capture,
+      fromScene: args.fromScene,
       signal: job.controller.signal,
       onSceneStart: (sceneId, index, total) => {
         job.currentScene = sceneId;
@@ -688,14 +883,17 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
     },
     (project, args) => async (job) =>
       jobs.runStage(job, "probe", async () => {
-        const storyboard = await project.loadStoryboard({
-          relaxed: true,
-          params: args.params,
-        });
+        const load = () =>
+          project.loadStoryboard({
+            relaxed: true,
+            params: args.params,
+          });
+        const storyboard = await load();
+        logLint(lintStoryboard(storyboard), log);
         const goldenMode = !!(args.golden || args.updateGolden);
         const probeScenes: ProbeGoldenScene[] = [];
         const timeline = await record(project, storyboard, {
-          ...recordOpts(args, job),
+          ...recordOpts(args, job, load),
           ...(goldenMode ? { probe: probeScenes } : {}),
         });
         const base = {
@@ -729,18 +927,67 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
               },
             };
           }
-          const diffs = diffGolden(expected, buildProbeGolden(storyboard, probeScenes));
+          const actual = buildProbeGolden(storyboard, probeScenes);
+          const diffs = diffGolden(expected, actual);
+          const drift = diffs.length ? await driftFilesForDiff(project, actual, diffs) : [];
           return {
             ...base,
             golden: {
               path: project.goldenProbePath,
               match: diffs.length === 0,
               diffs,
+              // Nearest-selector suggestions for the actions that flipped
+              // (logs/drift-<scene>-<n>.json — read them, fix, re-probe).
+              ...(drift.length ? { drift } : {}),
             },
           };
         }
         return base;
       })
+  );
+
+  server.registerTool(
+    "import_trace",
+    {
+      title: "Draft a storyboard from a Playwright trace or test",
+      description:
+        "Turn a Playwright trace.zip (context.tracing / `--trace on`) or a *.spec.ts " +
+        "test file into demos/<name>/ with a draft storyboard: the run's own actions " +
+        "and selectors become scenes (cut at navigations and async payoffs), narration " +
+        "is left as placeholders, and `_notes` lists what was approximated. No LLM, " +
+        "no browser. Then write the narration and probe.",
+      inputSchema: {
+        file: z.string().describe("absolute path to trace.zip or the test file"),
+        name: z.string().describe("demo name (creates demos/<name>/)"),
+        dir: z.string().optional().describe("repo to scaffold into (default: server cwd)"),
+        force: z.boolean().optional(),
+      },
+      outputSchema: {
+        demoDir: z.string(),
+        storyboardPath: z.string(),
+        steps: z.number(),
+        scenes: z.number(),
+        notes: z.array(z.string()),
+      },
+    },
+    async (args) => {
+      try {
+        const result = await importTrace(resolve(args.file), args.name);
+        const demoDir = await scaffoldImported(args.dir ? resolve(args.dir) : process.cwd(), args.name, result, {
+          force: args.force,
+        });
+        const project = new Project(demoDir);
+        return jsonResult({
+          demoDir,
+          storyboardPath: project.storyboardPath,
+          steps: result.steps,
+          scenes: (result.storyboard.scenes as unknown[]).length,
+          notes: result.notes,
+        });
+      } catch (err) {
+        return errorResult({ message: (err as Error).message });
+      }
+    }
   );
 
   registerJob(
@@ -749,8 +996,10 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
     RECORD_INPUT_SHAPE,
     (project, args) => async (job) =>
       jobs.runStage(job, "record", async () => {
-        const storyboard = await project.loadStoryboard({ params: args.params });
-        const timeline = await record(project, storyboard, recordOpts(args, job));
+        const load = () => project.loadStoryboard({ params: args.params });
+        const storyboard = await load();
+        logLint(lintStoryboard(storyboard), log);
+        const timeline = await record(project, storyboard, recordOpts(args, job, load));
         return {
           rawVideo: await project.resolveRawVideo(),
           timeline: project.timelinePath,
@@ -772,11 +1021,13 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
     (project, args) => async (job) =>
       jobs.runStage(job, "render", async () => {
         const signal = job.controller.signal;
-        const storyboard = await project.loadStoryboard({ params: args.params });
+        const load = () => project.loadStoryboard({ params: args.params });
+        const storyboard = await load();
         // Language variant (if any): voice/captions/compose run on a lang-scoped
         // project + localized storyboard; the take is recorded ONCE on the base.
         const lp = langProject(project, args.lang);
         const sb = args.lang ? localizeStoryboard(storyboard, args.lang) : storyboard;
+        logLint(lintStoryboard(storyboard, { lang: args.lang }), log);
         // Each sub-stage below is wrapped in runSubStage: it refreshes its OWN
         // stable logs/<stage>.log (not just logs/render.log) and updates
         // job.stage/currentScene/scenesTotal/scenesDone — same fields a
@@ -788,7 +1039,7 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
         );
         throwIfAborted(signal);
         await jobs.runSubStage(job, "record", () =>
-          record(project, storyboard, recordOpts(args, job))
+          record(project, storyboard, recordOpts(args, job, load))
         );
         throwIfAborted(signal);
         await jobs.runSubStage(job, "captions", async () => {
@@ -800,7 +1051,9 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
           }
         });
         throwIfAborted(signal);
-        await jobs.runSubStage(job, "compose", () => compose(lp, sb, sceneProgress(job)));
+        const report = await jobs.runSubStage(job, "compose", () =>
+          compose(lp, sb, sceneProgress(job))
+        );
         let gifPath: string | undefined;
         if (args.gif) {
           gifPath = await jobs.runSubStage(job, "gif", () => exportGif(lp));
@@ -811,12 +1064,22 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
         if (storyboardHasStills(storyboard)) {
           stills = await jobs.runSubStage(job, "stills", () => extractStills(project));
         }
+        let walkthrough: string | undefined;
+        if (storyboard.output?.walkthrough) {
+          walkthrough = (
+            await jobs.runSubStage(job, "walkthrough", () => exportWalkthrough(lp, sb))
+          ).index;
+        }
         return {
           output: lp.outputPath,
           ...(gifPath ? { gif: gifPath } : {}),
           ...(stills && stills.length ? { stills } : {}),
+          ...(walkthrough ? { walkthrough } : {}),
           timeline: lp.timelinePath,
           captionsSrt: lp.captionsSrtPath,
+          report: lp.reportPath,
+          durationMs: report.durationMs,
+          warnings: report.warnings,
         };
       })
   );
@@ -897,12 +1160,15 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
         const lp = langProject(project, args.lang);
         const storyboard = await project.loadStoryboard({ params: args.params });
         const sb = args.lang ? localizeStoryboard(storyboard, args.lang) : storyboard;
-        await compose(lp, sb, sceneProgress(job));
+        const report = await compose(lp, sb, sceneProgress(job));
         let gifPath: string | undefined;
         if (args.gif) gifPath = await exportGif(lp);
         return {
           output: lp.outputPath,
           ...(gifPath ? { gif: gifPath } : {}),
+          report: lp.reportPath,
+          durationMs: report.durationMs,
+          warnings: report.warnings,
         };
       })
   );
@@ -942,6 +1208,112 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
       jobs.runStage(job, "stills", async () => ({
         stills: await extractStills(project, { outDir: args.out }),
       }))
+  );
+
+  registerJob(
+    "frames",
+    "Dump evenly spaced PNG frames from the final video (or the raw take) into " +
+      "output/frames/ for review — look at them instead of hand-running " +
+      "`ffmpeg -ss`. Needs only the video (no key).",
+    {
+      dir: DIR_INPUT,
+      everySec: z.number().optional().describe("seconds between frames (default 3)"),
+      source: z
+        .enum(["final", "raw", "take"])
+        .optional()
+        .describe(
+          "final = output/final-demo.mp4 (default); raw = the latest raw file; " +
+            "take = the whole recorded take, across the raw files a resumed take is spliced from"
+        ),
+      width: z.number().optional().describe("frame width in px, aspect kept (default 640)"),
+      out: z.string().optional().describe("output directory (default <dir>/output/frames)"),
+    },
+    (project, args) => async (job) =>
+      jobs.runStage(job, "frames", async () => {
+        const res = await extractFrames(project, {
+          everySec: args.everySec,
+          source: args.source,
+          width: args.width,
+          outDir: args.out,
+        });
+        return {
+          source: res.source,
+          durationMs: res.durationMs,
+          everySec: res.everySec,
+          frames: res.files,
+        };
+      })
+  );
+
+  registerJob(
+    "walkthrough",
+    "Export output/walkthrough/ from the final video: index.html (one card per " +
+      "scene — payoff frame, title, narration, jump-to-time; ← → keyboard nav), " +
+      "guide.md (README/SOP-ready), per-scene PNGs, SRT/VTT and a JSON manifest. " +
+      "Needs only the rendered video + report.json (no key, no browser).",
+    {
+      dir: DIR_INPUT,
+      lang: z.string().optional().describe("language variant (final-demo.<lang>.mp4)"),
+      width: z.number().optional().describe("frame width in px (default 960)"),
+      out: z.string().optional().describe("output directory (default <dir>/output/walkthrough)"),
+    },
+    (project, args) => async (job) =>
+      jobs.runStage(job, "walkthrough", async () => {
+        const lp = args.lang ? new Project(project.dir, args.lang) : project;
+        const storyboard = await project.loadStoryboard({ relaxed: true });
+        const sb = args.lang ? localizeStoryboard(storyboard, args.lang) : storyboard;
+        const res = await exportWalkthrough(lp, sb, { width: args.width, outDir: args.out });
+        return {
+          dir: res.dir,
+          index: res.index,
+          guide: res.guide,
+          manifest: res.manifest,
+          scenes: res.scenes.length,
+        };
+      })
+  );
+
+  registerJob(
+    "inspect",
+    "Open a URL in the recording profile (logged-in state included) and list " +
+      "every visible interactive element with UNIQUE selectors ranked " +
+      "data-testid → id → aria-label → role/text → name/placeholder → class → " +
+      "path, plus headings and iframes. Use it BEFORE writing targets — no " +
+      "selector guessing, no wasted probe. Writes logs/inspect-<n>.json and a " +
+      "screenshot in the demo dir.",
+    {
+      dir: DIR_INPUT,
+      url: z.string().describe("page to inspect (absolute URL)"),
+      headless: z.boolean().optional().describe("default true"),
+      profile: z.string().optional().describe("Chrome user-data dir (default: the recording profile)"),
+      limit: z.number().int().min(5).max(400).optional().describe("max elements (default 80)"),
+      viewport: z
+        .object({ width: z.number().int(), height: z.number().int() })
+        .optional()
+        .describe("default 1280x720 (use the storyboard's video size)"),
+      frames: z
+        .record(z.string(), z.string())
+        .optional()
+        .describe("iframe selectors to scan too, as in the storyboard `frames` block"),
+    },
+    (project, args) => async (job) =>
+      jobs.runStage(job, "inspect", async () => {
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const png = project.p("logs", `inspect-${stamp}.png`);
+        const res = await inspectPage({
+          url: args.url,
+          headless: args.headless !== false,
+          profileDir: args.profile,
+          limit: args.limit,
+          viewport: args.viewport,
+          frames: args.frames,
+          screenshotPath: png,
+        });
+        const file = project.p("logs", `inspect-${stamp}.json`);
+        await writeJson(file, res);
+        log(`inspect: ${res.elements.length} element(s), ${res.headings.length} heading(s) → ${file}`);
+        return { ...res, file };
+      })
   );
 
   server.registerResource(

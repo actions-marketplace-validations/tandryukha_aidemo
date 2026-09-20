@@ -20,6 +20,14 @@ real Chrome, injected cursor, timeline) → `captions` (Whisper word timing) →
 | Fixture server | `node examples/local-demo/serve.mjs` (port 8787) |
 | E2E smoke test | `node bin/aidemo.mjs render examples/local-demo --headless` |
 | Dry-run actions only | `node bin/aidemo.mjs probe examples/local-demo --headless` |
+| Resume a take | `node bin/aidemo.mjs record <dir> --from-scene <id>` (also `render`, MCP `fromScene`) — reuses the previous take's earlier scenes (hash-guarded), replays their actions fast, records from `<id>` |
+| Draft from a Playwright trace/test | `node bin/aidemo.mjs import-trace <trace.zip\|spec.ts> --name <demo>` — actions + selectors → scenes, no LLM (MCP `import_trace`) |
+| Draft from a URL | `node bin/aidemo.mjs init <name> --from-url <url>` — inspect first, headings → scenes, unique selectors → beats (MCP `init_demo {fromUrl}`) |
+| Selector discovery | `node bin/aidemo.mjs inspect <url> --dir <demo>` — unique selectors per visible element (MCP `inspect` job); the same scan writes `logs/drift-*.json` suggestions when a take's selector matches nothing |
+| Validate a storyboard (no browser) | `node bin/aidemo.mjs validate <dir>` (`--file <path>`, `--json`; non-zero exit on issues) |
+| Lint / pacing forecast (no browser) | `node bin/aidemo.mjs lint <dir>` (`--lang`, `--json`, `--strict`) — also auto-runs in probe/record/render; measured counterpart is `output/report.json` from compose |
+| Frames for review | `node bin/aidemo.mjs frames <dir> --every 3` (`--source raw` for the take) |
+| Walkthrough bundle | `node bin/aidemo.mjs walkthrough <dir>` — output/walkthrough/ (index.html, guide.md, frames, captions) from the final video (also auto in `render` with `output.walkthrough`) |
 | One pipeline stage | `node bin/aidemo.mjs voice\|record\|captions\|compose <dir>` |
 | Screenshot stills | `node bin/aidemo.mjs stills <dir>` — extract named PNGs from an existing take (also auto-runs in `render` when the storyboard has `still` markers) |
 | Golden regression check | `node bin/aidemo.mjs probe <dir> --update-golden` (write baseline) / `--golden` (CI guard, non-zero exit on drift) |
@@ -28,7 +36,7 @@ real Chrome, injected cursor, timeline) → `captions` (Whisper word timing) →
 | Always-fresh embed snippets | `node bin/aidemo.mjs embed <dir>` — stable raw-GitHub URLs for READMEs/PRs |
 | CI render (consumers) | `uses: tandryukha/aidemo@stable` (composite action, `action.yml`) — see `docs/CI.md` |
 | MCP server (agent interface) | `node bin/aidemo.mjs mcp` — stdio; smoke test: `npm run mcp-smoke` (needs Chrome) |
-| Print authoring guide | `node bin/aidemo.mjs guide` |
+| Print authoring guide | `node bin/aidemo.mjs guide` (`--topic core\|schema\|attention\|polish\|…`, `--list`) |
 | Environment check | `node bin/aidemo.mjs doctor` |
 
 `render`, `voice`, and `captions` need `OPENAI_API_KEY` in `.env` (or
@@ -45,8 +53,20 @@ TTS/STT endpoint or the local provider).
 bin/aidemo.mjs        CLI entry (launches tsx → src/cli.ts)
 src/types.ts          storyboard schema (zod) — the contract everything shares
 src/                  pipeline stages: voice, recorder/player/cursor (record),
-                      captions/caption-render, compose/zoom/cards/music/ffmpeg,
-                      stills (screenshot mode), i18n (multi-language),
+                      captions/caption-render, compose/zoom/cards/music/ffmpeg
+                      (compose writes output/report.json), attention (highlight/
+                      spotlight/callout/keystroke/click-ring PNGs + redact blur
+                      filter), inspect (page scan → unique selectors; drift
+                      ranking for failed selectors), anchors ({{@word}} markers → piecewise
+                      retime), frame (produced-look canvas PNG), guide
+                      (topic slices of AUTHORING.md), import-trace (Playwright
+                      trace.zip / spec → draft storyboard), lint (browser-free
+                      pacing forecast + pitfalls), recorder (take lifecycle,
+                      resume via per-scene hashes + raw.keep-* footage),
+                      stills (screenshot mode), frames (review PNGs),
+                      walkthrough (HTML/Markdown bundle from the final video), setup
+                      (cookie/storageState seeding + preflight hook),
+                      i18n (multi-language),
                       params/variants (personalized renders), golden (probe
                       regression), embed (always-fresh URLs), capture
                       (native/OBS), starter (init templates), distribute
@@ -56,7 +76,8 @@ docs/AUTHORING.md     canonical authoring guide — served by the engine
                       (MCP get_authoring_guide / `aidemo guide`)
 action.yml            composite GitHub Action (uses: tandryukha/aidemo@stable)
 docs/CI.md            CI render recipe; docs/EMBEDS.md always-fresh embeds
-docs/plans/           deferred designs (e.g. public-mcp.md); docs/recipes/ how-tos
+docs/plans/           deferred designs (public-mcp.md) + roadmap-leftovers-2026-09.md
+                      (open items after v0.14.0); docs/recipes/ how-tos
 examples/workflows/   copy-paste consumer CI workflow templates
 .claude/skills/       record-demo (thin adapter → AUTHORING.md) + dev skills
 .claude-plugin/       marketplace.json — Claude Code plugin marketplace catalog
@@ -109,6 +130,10 @@ docs/                 public docs + README media (docs/internal/ is gitignored, 
 - `zoompan`: use `on/FPS` as the time base (input must be CFR), single-quote
   every expression (they contain commas), and pre-upscale 2× below ~1600 px
   width or integer-pixel crops shimmer.
+- The final mux writes `-movflags +faststart` (moov first, web-playable), so
+  **compare renders by stream, not by file hash**: `ffmpeg -i out.mp4 -map 0:v
+  -c copy -f md5 -` (and `-map 0:a`) must match the pre-change render for an
+  unchanged storyboard; the container bytes legitimately differ.
 - Debugging compose: `AIDEMO_KEEP_TMP=1` preserves `.compose-tmp/`
   intermediates. Logs land in `<demo>/logs/<command>.log`; a failed take also
   leaves `logs/fail-*.png/json`.

@@ -1,6 +1,8 @@
-import type { Page, Locator, Frame } from "playwright";
+import type { Page, Locator, Frame, Request, Response } from "playwright";
+import { scanInteractive, rankCandidates, type DriftCandidate } from "./inspect.js";
 import { promises as fs } from "node:fs";
-import { join } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
+import { existsSync } from "node:fs";
 import type {
   Storyboard,
   Scene,
@@ -13,8 +15,14 @@ import type {
   StillEvent,
   CursorSample,
   EasingPreset,
+  WaitState,
   ProbeActionOutcome,
   ProbeGoldenScene,
+  TimelineAction,
+  AttentionEvent,
+  KeyEvent,
+  RedactSpan,
+  Redact,
 } from "./types.js";
 import {
   easeInOutCubic,
@@ -68,6 +76,26 @@ export interface PlayerOptions {
   /** Called when a scene's first action is about to run (job progress). */
   onSceneStart?: (sceneId: string, index: number, total: number) => void;
   /**
+   * Resume: scenes before this index are REPLAYED, not recorded — their
+   * actions run at speed (no humanized typing, pauses/dwells capped, stills
+   * skipped) purely to rebuild the app state the resumed scene starts from,
+   * and they don't enter the returned timeline (the recorder reuses the
+   * previous take's footage for them).
+   */
+  replayUntil?: number;
+  /**
+   * With `replayUntil`: do NOT run the replayed scenes' actions at all — the
+   * app state is whatever the profile already holds. For flows that EARN
+   * one-shot state (a balance moved, a check-in was taken, a day was rolled
+   * forward by hand) a replay would fail or double-consume; the resumed scene
+   * must then open with its own `goto`.
+   */
+  skipReplay?: boolean;
+  /** Called after a replayed (not recorded) scene finished. */
+  onSceneReplayed?: (sceneId: string, index: number, total: number) => void;
+  /** Demo directory — `upload` file paths resolve against it (default: cwd). */
+  baseDir?: string;
+  /**
    * Best-effort cancellation, checked before every action. Aborting mid-scene
    * throws CanceledError, which rides the recorder's salvage path (partial
    * timeline + kept footage).
@@ -96,10 +124,178 @@ interface SceneCapture {
   focusEvents: FocusEvent[];
   stillEvents: StillEvent[];
   cursorSamples: CursorSample[];
+  actions: TimelineAction[];
+  attentionEvents: AttentionEvent[];
+  keyEvents: KeyEvent[];
+  redactSpans: RedactSpan[];
+  anchorEvents: Array<{ name: string; tMs: number; action: number }>;
+  /** Replay-only scene (resume): skip the waits that exist for the camera. */
+  fast?: boolean;
 }
+
+/** Record-time dwell for an attention beat (the hold itself is compose-time). */
+const ATTENTION_DWELL_MAX_MS = 800;
+const ATTENTION_HOLD_DEFAULT_MS = 1600;
+const CALLOUT_HOLD_DEFAULT_MS = 2000;
+/** Max matches per redact selector measured after each action. */
+const REDACT_MAX_MATCHES = 8;
+
+/** Pretty keystroke label for the chip: "Meta+K" → "⌘ K", "Enter" → "Enter". */
+export function prettyKeys(key: string): string {
+  const map: Record<string, string> = {
+    meta: "⌘",
+    cmd: "⌘",
+    command: "⌘",
+    control: "Ctrl",
+    ctrl: "Ctrl",
+    shift: "⇧",
+    alt: "⌥",
+    option: "⌥",
+    enter: "Enter",
+    return: "Enter",
+    escape: "Esc",
+    backspace: "⌫",
+    delete: "Del",
+    tab: "Tab",
+    space: "Space",
+    arrowup: "↑",
+    arrowdown: "↓",
+    arrowleft: "←",
+    arrowright: "→",
+    pageup: "PgUp",
+    pagedown: "PgDn",
+  };
+  return key
+    .split("+")
+    .map((k) => map[k.toLowerCase()] ?? (k.length === 1 ? k.toUpperCase() : k))
+    .join(" ");
+}
+
+/** Ops `retry` applies to: interactions whose failure is usually transient. */
+const RETRYABLE_OPS = new Set([
+  "click",
+  "type",
+  "hover",
+  "scrollTo",
+  "focus",
+  "moveTo",
+  "assert",
+  "highlight",
+  "spotlight",
+  "callout",
+]);
+const RETRY_GAP_MS = 400;
+
+/** After `goto`'s domcontentloaded: how long we're willing to wait for quiet. */
+const GOTO_QUIET_CAP_MS = 3400;
 
 /** Records a cursor position into the current scene (compose-cursor mode only). */
 type CursorSampler = (x: number, y: number) => void;
+
+/** A failed network exchange seen during the take (issue #44). */
+export interface FailedRequest {
+  /** Timeline offset (ms since t0) when the response/failure arrived. */
+  tMs: number;
+  method: string;
+  url: string;
+  /** HTTP status, or null when the request never got a response. */
+  status: number | null;
+  /** Playwright's failure text for a request that never got a response. */
+  error?: string;
+  resourceType: string;
+  /** First bytes of an xhr/fetch error body — often the actual reason. */
+  body?: string;
+}
+
+const NET_WATCH_CAP = 300;
+const NET_BODY_MAX = 300;
+
+/**
+ * Passive watch for HTTP ≥400 responses and failed requests across the page
+ * (all frames). The engine has no other visibility into app-side writes: a
+ * backend 500 on a check-in click looks exactly like a missed click in the
+ * screenshot (issue #44), so a failing action's window is dumped into
+ * logs/fail-*.json. Ring-buffered; never throws.
+ */
+class NetworkWatch {
+  private entries: FailedRequest[] = [];
+  private readonly onResponse: (res: Response) => void;
+  private readonly onFailed: (req: Request) => void;
+
+  constructor(
+    private readonly page: Page,
+    private readonly t0: number
+  ) {
+    this.onResponse = (res: Response) => {
+      if (res.status() < 400) return;
+      const req = res.request();
+      const entry: FailedRequest = {
+        tMs: Date.now() - t0,
+        method: req.method(),
+        url: truncateUrl(res.url(), 200),
+        status: res.status(),
+        resourceType: req.resourceType(),
+      };
+      this.push(entry);
+      if (/^(xhr|fetch)$/.test(entry.resourceType)) {
+        res
+          .text()
+          .then((b) => {
+            const snippet = b.replace(/\s+/g, " ").trim().slice(0, NET_BODY_MAX);
+            if (snippet) entry.body = snippet;
+          })
+          .catch(() => {});
+      }
+    };
+    this.onFailed = (req: Request) => {
+      const err = req.failure()?.errorText ?? "failed";
+      // Navigations cancel in-flight requests; that's not an app failure.
+      if (/ERR_ABORTED/.test(err)) return;
+      this.push({
+        tMs: Date.now() - t0,
+        method: req.method(),
+        url: truncateUrl(req.url(), 200),
+        status: null,
+        error: err,
+        resourceType: req.resourceType(),
+      });
+    };
+  }
+
+  private push(e: FailedRequest): void {
+    this.entries.push(e);
+    if (this.entries.length > NET_WATCH_CAP) this.entries.shift();
+  }
+
+  start(): void {
+    this.page.on("response", this.onResponse);
+    this.page.on("requestfailed", this.onFailed);
+  }
+
+  stop(): void {
+    this.page.off("response", this.onResponse);
+    this.page.off("requestfailed", this.onFailed);
+  }
+
+  /** Failures that arrived at or after `tMs` (a failing action's window). */
+  since(tMs: number): FailedRequest[] {
+    return this.entries.filter((e) => e.tMs >= tMs);
+  }
+}
+
+/** One-line-per-entry summary for the log (≤ `max` lines). */
+function describeFailedRequests(list: FailedRequest[], max = 5): string[] {
+  const lines = list
+    .slice(-max)
+    .map(
+      (e) =>
+        `    ${e.status ?? "ERR"} ${e.method} ${e.url}` +
+        (e.error ? ` — ${e.error}` : "") +
+        (e.body ? ` — ${JSON.stringify(e.body.slice(0, 120))}` : "")
+    );
+  if (list.length > max) lines.unshift(`    … ${list.length - max} earlier`);
+  return lines;
+}
 
 export async function runStoryboard(
   page: Page,
@@ -115,7 +311,11 @@ export async function runStoryboard(
 
   const now = () => Date.now() - opts.t0;
   const scenes: TimelineScene[] = [];
+  const net = new NetworkWatch(page, opts.t0);
+  net.start();
+  let prevActionStartMs = 0;
 
+  try {
   const total = storyboard.scenes.length;
   for (let si = 0; si < total; si++) {
     const scene = storyboard.scenes[si];
@@ -125,7 +325,23 @@ export async function runStoryboard(
       focusEvents: [],
       stillEvents: [],
       cursorSamples: [],
+      actions: [],
+      attentionEvents: [],
+      keyEvents: [],
+      redactSpans: [],
+      anchorEvents: [],
+      fast: opts.replayUntil != null && si < opts.replayUntil,
     };
+    // Per-scene `hide` (top-level hides are injected by the recorder's init
+    // script so they survive navigations); applied now, removed at scene end.
+    if (scene.hide?.length) await setSceneHide(page, scene.hide);
+    const redactList: Redact[] = [...(storyboard.redact ?? []), ...(scene.redact ?? [])];
+    const redactOpen = new Map<string, RedactSpan>();
+    const measureRedact = async (): Promise<void> => {
+      if (!redactList.length) return;
+      await measureRedactions(page, storyboard, redactList, redactOpen, capture, now);
+    };
+    await measureRedact();
     // Cursor path sampler — only records when the storyboard opts into the
     // compose-time cursor overlay, so a plain take's timeline stays unchanged.
     const sample: CursorSampler | undefined = opts.captureCursorPath
@@ -136,8 +352,17 @@ export async function runStoryboard(
             y: Math.round(y),
           })
       : undefined;
-    log(`scene ${scene.id}: ${scene.actions.length} action(s)`);
+    log(
+      `scene ${scene.id}: ${scene.actions.length} action(s)` +
+        (capture.fast ? " (replay only — footage reused from the previous take)" : "")
+    );
     opts.onSceneStart?.(scene.id, si, total);
+    if (capture.fast && opts.skipReplay) {
+      log(`  --no-replay: actions skipped, app state left as the profile holds it`);
+      if (scene.hide?.length) await setSceneHide(page, []);
+      opts.onSceneReplayed?.(scene.id, si, total);
+      continue;
+    }
     const probeOutcomes: ProbeActionOutcome[] = [];
 
     for (let i = 0; i < scene.actions.length; i++) {
@@ -145,13 +370,43 @@ export async function runStoryboard(
         throw new CanceledError(`canceled during scene ${scene.id}`);
       const action = scene.actions[i];
       const outcome = opts.probe ? initProbeOutcome(storyboard, action) : null;
+      // Failed-request window for diagnostics: from the PREVIOUS action's
+      // start — the failing action is usually the wait after the click whose
+      // XHR actually failed (issue #44).
+      const netWindowMs = prevActionStartMs;
+      prevActionStartMs = now();
+      const rec: TimelineAction = {
+        index: i,
+        op: action.op,
+        startMs: now(),
+        endMs: 0,
+        ok: false,
+      };
+      const recTarget = describeActionTarget(storyboard, action);
+      if (recTarget) rec.target = recTarget;
+      const recWarnings: string[] = [];
       try {
         if (await optionalTargetAbsent(page, storyboard, action)) {
           log(`  ⚠ optional ${action.op} skipped — target not present`);
+          rec.skipped = true;
+          recWarnings.push("optional: target not present");
         } else {
-          await runAction(page, storyboard, action, mouse, capture, opts, sample);
+          const retries = await runActionWithRetry(
+            page,
+            storyboard,
+            action,
+            mouse,
+            capture,
+            opts,
+            sample
+          );
+          if (retries > 0) {
+            rec.retries = retries;
+            recWarnings.push(`succeeded after ${retries} retr${retries === 1 ? "y" : "ies"}`);
+          }
         }
         if (outcome) outcome.ok = true;
+        rec.ok = true;
       } catch (err) {
         if (action.optional) {
           // Best-effort by authoring contract: log and continue. Counts as ok
@@ -159,23 +414,75 @@ export async function runStoryboard(
           // an optional action's outcome varies by environment state, which
           // is the point of marking it optional.
           if (outcome) outcome.ok = true;
+          rec.ok = true;
+          rec.skipped = true;
+          recWarnings.push(`optional: ${firstLine(err)}`);
           log(`  ⚠ optional ${action.op} skipped — ${firstLine(err)}`);
         } else if (outcome) {
           // Golden probe: record the failure and keep going, so a broken
           // selector shows up as a single flipped field in the diff instead of
           // aborting the whole projection.
           outcome.ok = false;
+          recWarnings.push(firstLine(err));
           log(
             `  ✗ probe: ${action.op} failed — ${firstLine(err)}`
           );
+          const failed = net.since(netWindowMs);
+          if (failed.length) {
+            log(`    ${failed.length} failed request(s) since the previous action:`);
+            for (const l of describeFailedRequests(failed)) log(l);
+          }
+          // Same screenshot + drift suggestions as a hard failure, so a golden
+          // mismatch points at the nearest replacement selector.
+          if (opts.logsDir) {
+            const diag = await dumpDiagnostics(
+              page,
+              storyboard,
+              scene.id,
+              i,
+              action,
+              opts.logsDir,
+              failed
+            ).catch(() => "");
+            for (const l of diag.split("\n")) if (l) log(l);
+          }
         } else {
           // Name the failing scene/action, screenshot the page, and dump the
           // widget frames present — so a phantom click or a platform
           // interruption is diagnosable from the log instead of by
           // hand-extracting webm frames.
-          await failAction(page, storyboard, scene, i, action, opts, err);
+          rec.endMs = now();
+          recWarnings.push(firstLine(err));
+          rec.warnings = recWarnings;
+          capture.actions.push(rec);
+          await failAction(page, storyboard, scene, i, action, opts, err, {
+            failedRequests: net.since(netWindowMs),
+          });
         }
       }
+      rec.endMs = now();
+      const failedInWindow = net.since(rec.startMs);
+      if (failedInWindow.length) {
+        recWarnings.push(
+          `${failedInWindow.length} failed request(s): ` +
+            failedInWindow
+              .slice(-3)
+              .map((e) => `${e.status ?? "ERR"} ${e.method} ${e.url}`)
+              .join("; ")
+        );
+      }
+      if (recWarnings.length) rec.warnings = recWarnings;
+      capture.actions.push(rec);
+      if (action.anchor && !rec.skipped) {
+        // The beat = the action's focus moment when it produced one (a click
+        // fires its focus event right after the press), else the action start.
+        const focusAt = capture.focusEvents.length
+          ? capture.focusEvents[capture.focusEvents.length - 1].tMs
+          : -1;
+        const tMs = focusAt >= rec.startMs && focusAt <= rec.endMs ? focusAt : rec.startMs;
+        capture.anchorEvents.push({ name: action.anchor, tMs, action: i });
+      }
+      await measureRedact();
       if (outcome) {
         // Optional actions skip the found-enrichment: whether their target
         // resolves is environment-dependent, and the golden projection must
@@ -187,6 +494,17 @@ export async function runStoryboard(
       }
     }
     if (opts.probe) opts.probe.push({ id: scene.id, actions: probeOutcomes });
+    // Close every open redact span at the scene boundary and drop the scene hide.
+    for (const span of redactOpen.values()) {
+      span.endMs = now();
+      capture.redactSpans.push(span);
+    }
+    redactOpen.clear();
+    if (scene.hide?.length) await setSceneHide(page, []);
+    if (capture.fast) {
+      opts.onSceneReplayed?.(scene.id, si, total);
+      continue;
+    }
 
     const tlScene: TimelineScene = {
       id: scene.id,
@@ -196,9 +514,17 @@ export async function runStoryboard(
       focusEvents: capture.focusEvents,
       stillEvents: capture.stillEvents,
       cursorSamples: capture.cursorSamples,
+      actions: capture.actions,
+      attentionEvents: capture.attentionEvents,
+      keyEvents: capture.keyEvents,
+      redactSpans: capture.redactSpans,
+      anchorEvents: capture.anchorEvents,
     };
     scenes.push(tlScene);
     opts.onSceneComplete?.(tlScene, si, total);
+  }
+  } finally {
+    net.stop();
   }
 
   // leadInMs is filled in by the recorder (it knows the video start).
@@ -430,25 +756,35 @@ async function resolveTargetLocator(
   return frame.locator(selector).first();
 }
 
+/** Human-readable target for error messages: `frame >> selector [last]`. */
+function describeTarget(storyboard: Storyboard, target: Target): string {
+  return describeProbeTarget(storyboard, target);
+}
+
 /**
- * Wait until `target` resolves to a visible element, re-resolving each poll so
- * a nested widget frame that appears (and fills) mid-wait is picked up. Returns
- * the elapsed wait; throws on timeout.
+ * Wait until `target` resolves to an element in `state` ("visible" by default,
+ * or merely "attached" for zero-size mount points), re-resolving each poll so
+ * a nested widget frame that appears (and fills) mid-wait is picked up.
+ * Throws on timeout — naming the TOTAL budget waited, not Playwright's last
+ * ~2.5 s poll chunk (which read as "Timeout 1945ms exceeded" against a 30 s
+ * storyboard budget and sent people hunting a bug that didn't exist, #44).
  */
 async function waitForTargetVisible(
   page: Page,
   storyboard: Storyboard,
   target: Target,
-  timeoutMs: number
+  timeoutMs: number,
+  state: WaitState = "visible"
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  const started = Date.now();
+  const deadline = started + timeoutMs;
   let lastErr: unknown;
   for (;;) {
     try {
       const loc = await resolveTargetLocator(page, storyboard, target);
       const remaining = deadline - Date.now();
       await loc.waitFor({
-        state: "visible",
+        state,
         timeout: Math.max(400, Math.min(2500, remaining)),
       });
       return;
@@ -456,11 +792,56 @@ async function waitForTargetVisible(
       lastErr = err;
     }
     if (Date.now() >= deadline) {
-      throw lastErr instanceof Error
-        ? lastErr
-        : new Error(`waitForTargetVisible timed out for ${JSON.stringify(target)}`);
+      const waited = Date.now() - started;
+      const reason = lastErr instanceof Error ? firstLine(lastErr) : String(lastErr);
+      const hint = /Timeout \d+ms exceeded/.test(reason)
+        ? "" // Playwright's chunk timeout — nothing more to say than the budget
+        : ` (last error: ${reason})`;
+      throw new Error(
+        `waitFor: "${describeTarget(storyboard, target)}" not ${state} after ` +
+          `${waited}ms (budget ${timeoutMs}ms)${hint}` +
+          (state === "visible"
+            ? ` — if the element is a zero-size mount point that fills later, use state: "attached"`
+            : "")
+      );
     }
     await sleep(300);
+  }
+}
+
+/**
+ * Wait until the scroll position has been still for `settleMs` (bounded at
+ * 3 s total) — an honest "scroll finished" for smooth-scrolling pages, where a
+ * fixed pause is a race. `sampleAt` reads a position signature; the default is
+ * the main document's scroll offset.
+ */
+async function waitScrollSettled(
+  page: Page,
+  settleMs: number,
+  loc?: Locator
+): Promise<void> {
+  const quiet = Math.max(50, settleMs);
+  const deadline = Date.now() + Math.max(quiet, 3000);
+  const sampleAt = async (): Promise<string> => {
+    if (loc) {
+      const box = await loc.boundingBox().catch(() => null);
+      if (box) return `${Math.round(box.x)},${Math.round(box.y)}`;
+    }
+    return page
+      .evaluate(() => `${Math.round(scrollX)},${Math.round(scrollY)}`)
+      .catch(() => "");
+  };
+  let last = await sampleAt();
+  let stillSince = Date.now();
+  while (Date.now() < deadline) {
+    await sleep(50);
+    const cur = await sampleAt();
+    if (cur !== last) {
+      last = cur;
+      stillSince = Date.now();
+    } else if (Date.now() - stillSince >= quiet) {
+      return;
+    }
   }
 }
 
@@ -595,7 +976,17 @@ async function waitForNewReply(
  * probe first. Wait ops are excluded — waiting is their whole job, and they
  * carry their own timeoutMs.
  */
-const INTERACTION_OPS = new Set(["click", "type", "hover", "scrollTo", "focus"]);
+const INTERACTION_OPS = new Set([
+  "click",
+  "type",
+  "hover",
+  "scrollTo",
+  "focus",
+  "moveTo",
+  "highlight",
+  "spotlight",
+  "callout",
+]);
 const OPTIONAL_PROBE_MS = 3000;
 
 /**
@@ -609,14 +1000,72 @@ async function optionalTargetAbsent(
   storyboard: Storyboard,
   action: Action
 ): Promise<boolean> {
-  if (!action.optional || !INTERACTION_OPS.has(action.op) || !("target" in action)) {
+  const target = (action as { target?: Target }).target;
+  if (!action.optional || !INTERACTION_OPS.has(action.op) || !target) {
     return false;
   }
+  const state = (action as { state?: WaitState }).state ?? "visible";
   try {
-    await waitForTargetVisible(page, storyboard, action.target, OPTIONAL_PROBE_MS);
+    await waitForTargetVisible(page, storyboard, target, OPTIONAL_PROBE_MS, state);
     return false;
   } catch {
     return true;
+  }
+}
+
+/**
+ * Run an action, re-attempting it `action.retry` times (retryable ops only)
+ * with a beat between attempts. Returns the number of extra attempts used.
+ * The last failure propagates so the normal fail/optional paths apply.
+ */
+async function runActionWithRetry(
+  page: Page,
+  storyboard: Storyboard,
+  action: Action,
+  mouse: MouseState,
+  capture: SceneCapture,
+  opts: PlayerOptions,
+  sample?: CursorSampler
+): Promise<number> {
+  const budget = action.retry && RETRYABLE_OPS.has(action.op) ? action.retry : 0;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await runAction(page, storyboard, action, mouse, capture, opts, sample);
+      return attempt;
+    } catch (err) {
+      if (attempt >= budget || opts.signal?.aborted) throw err;
+      log(
+        `  ↻ ${action.op} failed (${firstLine(err)}) — retry ${attempt + 1}/${budget}`
+      );
+      await sleep(RETRY_GAP_MS);
+    }
+  }
+}
+
+/**
+ * After a navigation's domcontentloaded: wait for the page to go quiet (no
+ * network for 500 ms, fonts loaded), capped. The wait beyond the classic
+ * 600 ms settle is recorded as an idle span so compose trims it — the take
+ * doesn't get slower, but the first click no longer lands on a half-fetched
+ * page (a skeleton screen, a still-loading nav) and gets misread as a miss.
+ */
+async function awaitGotoReadiness(
+  page: Page,
+  capture: SceneCapture,
+  t0: number
+): Promise<void> {
+  await sleep(600);
+  const start = Date.now();
+  await Promise.all([
+    page.waitForLoadState("networkidle", { timeout: GOTO_QUIET_CAP_MS }).catch(() => {}),
+    page
+      .evaluate(() => (document as unknown as { fonts?: { ready: Promise<unknown> } }).fonts?.ready)
+      .catch(() => {}),
+  ]);
+  const waited = Date.now() - start;
+  if (waited > 150) {
+    capture.idleSpans.push({ startMs: start - t0, endMs: Date.now() - t0, label: "load" });
+    log(`  page quiet after +${waited}ms (idle "load")`);
   }
 }
 
@@ -636,13 +1085,165 @@ async function runAction(
   switch (action.op) {
     case "goto":
       await page.goto(action.url, { waitUntil: "domcontentloaded" });
-      await sleep(600);
+      await awaitGotoReadiness(page, capture, t0);
       return;
+
+    case "moveTo": {
+      if (!action.target && (action.x == null || action.y == null)) {
+        throw new Error("moveTo needs a target or both x and y");
+      }
+      let x = action.x ?? mouse.x;
+      let y = action.y ?? mouse.y;
+      if (action.target) {
+        const loc = await resolveTargetLocator(page, storyboard, action.target);
+        const box = await boxOf(page, loc);
+        x = box.cx;
+        y = box.cy;
+      }
+      await moveMouseTo(page, mouse, x, y, sample);
+      await sleep(150);
+      return;
+    }
+
+    case "assert": {
+      if (!action.target && !action.url) {
+        throw new Error("assert needs a target and/or a url");
+      }
+      const timeoutMs = action.timeoutMs ?? 5000;
+      const deadline = Date.now() + timeoutMs;
+      const textRe = action.textMatches ? new RegExp(action.textMatches) : null;
+      const urlRe = action.url ? new RegExp(action.url) : null;
+      let why = "";
+      if (action.target) {
+        // Visible first (honest total-budget error if it never shows up).
+        await waitForTargetVisible(page, storyboard, action.target, timeoutMs);
+      }
+      for (;;) {
+        why = "";
+        if (urlRe && !urlRe.test(page.url())) {
+          why = `url ${JSON.stringify(page.url())} does not match /${action.url}/`;
+        } else if (textRe && action.target) {
+          const loc = await resolveTargetLocator(page, storyboard, action.target);
+          const text =
+            ((await loc.first().textContent({ timeout: 800 }).catch(() => null)) ?? "")
+              .replace(/\s+/g, " ")
+              .trim();
+          if (!textRe.test(text)) {
+            why =
+              `text ${JSON.stringify(text.slice(0, 80))} does not match ` +
+              `/${action.textMatches}/`;
+          }
+        }
+        if (!why) return;
+        if (Date.now() >= deadline) break;
+        await sleep(200);
+      }
+      throw new Error(
+        `assert failed after ${timeoutMs}ms: ${why}` +
+          (action.comment ? ` — ${action.comment}` : "")
+      );
+    }
 
     case "click": {
       const loc = await resolveTargetLocator(page, storyboard, action.target);
+      // followPopup: catch a tab the click opens, then bring its URL into the
+      // recorded tab — Playwright records one video per page, so a second tab
+      // would never reach the take.
+      const popup = action.followPopup
+        ? page.context().waitForEvent("page", { timeout: 4000 }).catch(() => null)
+        : null;
       const { cx, cy } = await humanClick(page, loc, mouse, !!action.target.frame, sample);
       markFocus(cx, cy, "click");
+      if (popup) {
+        const tab = await popup;
+        if (tab) {
+          await tab.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+          const url = tab.url();
+          await tab.close().catch(() => {});
+          if (url && url !== "about:blank") {
+            log(`  popup → ${url} (followed in the recorded tab)`);
+            await page.goto(url, { waitUntil: "domcontentloaded" });
+            await awaitGotoReadiness(page, capture, t0);
+          } else {
+            log("  ! popup opened without a URL; nothing to follow");
+          }
+        } else {
+          log("  (followPopup: the click opened no new tab)");
+        }
+      }
+      return;
+    }
+
+    case "back":
+      await page.goBack({ waitUntil: "domcontentloaded" });
+      await awaitGotoReadiness(page, capture, t0);
+      return;
+
+    case "select": {
+      if (action.value == null && action.label == null) {
+        throw new Error("select needs a value or a label");
+      }
+      const loc = await resolveTargetLocator(page, storyboard, action.target);
+      const { cx, cy } = await humanClick(page, loc, mouse, !!action.target.frame, sample);
+      markFocus(cx, cy, "click");
+      // The native dropdown never paints into the recording; commit the choice
+      // programmatically (fires input/change like a real pick) and close it.
+      await loc.selectOption(action.value != null ? { value: action.value } : { label: action.label! });
+      await page.keyboard.press("Escape").catch(() => {});
+      await sleep(200);
+      return;
+    }
+
+    case "drag": {
+      if (!action.to.target && (action.to.x == null || action.to.y == null)) {
+        throw new Error("drag needs `to.target` or both `to.x` and `to.y`");
+      }
+      const loc = await resolveTargetLocator(page, storyboard, action.target);
+      const from = await boxOf(page, loc);
+      let tx = action.to.x ?? mouse.x;
+      let ty = action.to.y ?? mouse.y;
+      if (action.to.target) {
+        const dest = await resolveTargetLocator(page, storyboard, action.to.target);
+        const box = await boxOf(page, dest);
+        tx = box.cx;
+        ty = box.cy;
+      }
+      await moveMouseTo(page, mouse, from.cx, from.cy, sample);
+      await sleep(120);
+      await page.mouse.down();
+      // A few pixels first so HTML5 drag-and-drop and pointer-based libraries
+      // both pass their drag threshold before the real glide.
+      await page.mouse.move(from.cx + 4, from.cy + 4);
+      await sleep(80);
+      await moveMouseTo(page, mouse, tx, ty, sample);
+      await sleep(120);
+      await page.mouse.up();
+      markFocus(tx, ty, "drag");
+      await sleep(200);
+      return;
+    }
+
+    case "upload": {
+      const loc = await resolveTargetLocator(page, storyboard, action.target);
+      const files = action.files.map((f) =>
+        isAbsolute(f) ? f : resolve(opts.baseDir ?? process.cwd(), f)
+      );
+      for (const f of files) {
+        if (!existsSync(f)) throw new Error(`upload: file not found: ${f}`);
+      }
+      const isFileInput = await loc
+        .evaluate((el) => el.tagName === "INPUT" && (el as HTMLInputElement).type === "file")
+        .catch(() => false);
+      if (isFileInput) {
+        await loc.setInputFiles(files);
+      } else {
+        const chooser = page.waitForEvent("filechooser", { timeout: 8000 });
+        const { cx, cy } = await humanClick(page, loc, mouse, !!action.target.frame, sample);
+        markFocus(cx, cy, "click");
+        await (await chooser).setFiles(files);
+      }
+      log(`  upload: ${files.map((f) => basename(f)).join(", ")}`);
+      await sleep(300);
       return;
     }
 
@@ -679,14 +1280,48 @@ async function runAction(
         await page.keyboard.press("ControlOrMeta+a");
         await page.keyboard.press("Backspace");
       }
-      await humanType(page, loc, action.text, action.humanize !== false);
+      await humanType(page, loc, action.text, !capture.fast && action.humanize !== false);
       return;
     }
 
     case "press":
+      if (action.keystrokes ?? storyboard.keystrokes) {
+        capture.keyEvents.push({ tMs: Date.now() - t0, keys: prettyKeys(action.key) });
+      }
       await page.keyboard.press(action.key);
       await sleep(200);
       return;
+
+    case "highlight":
+    case "spotlight":
+    case "callout": {
+      const loc = await resolveTargetLocator(page, storyboard, action.target);
+      const rect = await rectOf(page, loc);
+      const holdMs =
+        action.holdMs ??
+        (action.op === "callout" ? CALLOUT_HOLD_DEFAULT_MS : ATTENTION_HOLD_DEFAULT_MS);
+      const ev: AttentionEvent = {
+        tMs: Date.now() - t0,
+        kind: action.op,
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+        holdMs,
+      };
+      if (action.style) ev.style = action.style;
+      if (action.op === "callout") {
+        ev.text = action.text;
+        if (action.placement) ev.placement = action.placement;
+      }
+      if (action.op === "spotlight") {
+        if (action.dimTo != null) ev.dimTo = action.dimTo;
+        if (action.padding != null) ev.padding = action.padding;
+      }
+      capture.attentionEvents.push(ev);
+      if (!capture.fast) await sleep(Math.min(holdMs, ATTENTION_DWELL_MAX_MS));
+      return;
+    }
 
     case "hover": {
       const loc = await resolveTargetLocator(page, storyboard, action.target);
@@ -717,6 +1352,7 @@ async function runAction(
       // Let the frame settle first, then record the marker at the settled
       // moment so compose-time extraction lands on a clean frame (not mid-
       // transition). The PNG is pulled from the CLEAN take by `aidemo stills`.
+      if (capture.fast) return;
       await sleep(120);
       capture.stillEvents.push({ tMs: Date.now() - t0, name: action.name });
       log(`  still "${action.name}" @ ${Date.now() - t0}ms`);
@@ -724,7 +1360,13 @@ async function runAction(
     }
 
     case "scrollTo": {
+      const state = action.state ?? "visible";
       const loc = await resolveTargetLocator(page, storyboard, action.target);
+      if (state === "attached") {
+        // A zero-size mount point has no visibility to wait for; require it
+        // to be in the DOM, then scroll by geometry alone (issue #44).
+        await waitForTargetVisible(page, storyboard, action.target, 15000, "attached");
+      }
       // Top-page targets get the cinematic eased scroll; targets inside a
       // frame keep the reliable scrollIntoViewIfNeeded (wheel deltas would go
       // to whatever scroller is under the cursor, not necessarily the frame).
@@ -735,13 +1377,74 @@ async function runAction(
           if (Math.abs(dy) > 30) await easedWheel(page, dy, action);
         }
       }
-      await loc.scrollIntoViewIfNeeded();
-      await sleep(300);
+      if (state === "attached") {
+        // scrollIntoViewIfNeeded needs a visible element; a plain
+        // scrollIntoView on the node works for an empty one.
+        await loc
+          .evaluate((el) => el.scrollIntoView({ block: "center" }))
+          .catch(() => {});
+      } else {
+        await loc.scrollIntoViewIfNeeded();
+      }
+      if (action.settleMs != null) {
+        await waitScrollSettled(page, action.settleMs, loc);
+      } else {
+        await sleep(300);
+      }
       return;
     }
 
     case "scrollBy": {
-      await easedWheel(page, action.dy, action);
+      let dy = action.dy;
+      let loc: Locator | undefined;
+      if (action.target) {
+        // Target-scoped scroll (issue #43): wheel OVER the element, and never
+        // more than its own scroller has room for — a bottomed-out inner
+        // panel otherwise chains the wheel to the page and the whole app
+        // slides off-screen mid-take with nothing failing.
+        loc = await resolveTargetLocator(page, storyboard, action.target);
+        await waitForTargetVisible(page, storyboard, action.target, 15000, "attached");
+        const box = await loc.boundingBox().catch(() => null);
+        if (box) {
+          const vp = page.viewportSize() ?? opts.video;
+          const cx = Math.min(Math.max(box.x + box.width / 2, 2), vp.width - 2);
+          const cy = Math.min(Math.max(box.y + box.height / 2, 2), vp.height - 2);
+          await moveMouseTo(page, mouse, cx, cy, sample);
+        }
+        // NOTE: no inner named functions inside evaluate callbacks — tsx's
+        // esbuild keepNames wraps them in a `__name` helper that doesn't
+        // exist in the page (ReferenceError, swallowed → no clamp).
+        const room = await loc
+          .evaluate((el, want) => {
+            let n: Element | null = el;
+            while (
+              n &&
+              !(
+                /(auto|scroll|overlay)/.test(getComputedStyle(n).overflowY) &&
+                n.scrollHeight > n.clientHeight + 1
+              )
+            ) {
+              n = n.parentElement;
+            }
+            const sc = n ?? document.scrollingElement ?? document.documentElement;
+            return want > 0
+              ? sc.scrollHeight - sc.clientHeight - sc.scrollTop
+              : sc.scrollTop;
+          }, dy)
+          .catch((err: Error) => {
+            log(`  ! scrollBy: could not measure target scroller (${firstLine(err)}); unclamped`);
+            return Math.abs(dy);
+          });
+        if (Math.abs(dy) > room) {
+          log(
+            `  scrollBy clamped ${dy} → ${Math.sign(dy) * Math.round(room)}px ` +
+              `(target's scroller has no more room)`
+          );
+          dy = Math.sign(dy) * room;
+        }
+      }
+      if (Math.abs(dy) >= 1) await easedWheel(page, dy, action);
+      if (action.settleMs != null) await waitScrollSettled(page, action.settleMs, loc);
       return;
     }
 
@@ -750,7 +1453,8 @@ async function runAction(
         page,
         storyboard,
         action.target,
-        action.timeoutMs ?? 15000
+        action.timeoutMs ?? 15000,
+        action.state ?? "visible"
       );
       return;
     }
@@ -795,7 +1499,8 @@ async function runAction(
     }
 
     case "pause":
-      await sleep(action.ms);
+      // A replayed scene (resume) only needs the state, not the beat.
+      await sleep(capture.fast ? Math.min(action.ms, 100) : action.ms);
       return;
   }
 }
@@ -842,6 +1547,7 @@ function initProbeOutcome(
       break;
     case "scrollBy":
       o.dy = action.dy;
+      if (action.target) o.target = describeProbeTarget(storyboard, action.target);
       break;
     case "waitForReply":
       o.target = action.selector ?? ASSISTANT_MESSAGE_SELECTOR;
@@ -858,10 +1564,32 @@ function initProbeOutcome(
     case "scrollTo":
     case "waitFor":
     case "focus":
+    case "highlight":
+    case "spotlight":
+    case "callout":
+    case "select":
+    case "drag":
+    case "upload":
       o.target = describeProbeTarget(storyboard, action.target);
+      break;
+    case "moveTo":
+      o.target = action.target
+        ? describeProbeTarget(storyboard, action.target)
+        : `${action.x},${action.y}`;
+      break;
+    case "assert":
+      o.target = action.target
+        ? describeProbeTarget(storyboard, action.target)
+        : `url:${action.url}`;
       break;
   }
   return o;
+}
+
+/** The timeline.json `actions[].target` string for any action (or undefined). */
+function describeActionTarget(storyboard: Storyboard, action: Action): string | undefined {
+  const t = initProbeOutcome(storyboard, action).target;
+  return t;
 }
 
 /** Add the post-run stable signals: goto's final URL, target element-found. */
@@ -882,8 +1610,9 @@ async function enrichProbeOutcome(
     );
     return;
   }
-  if ("target" in action) {
-    o.found = await targetResolves(page, storyboard, action.target);
+  const target = (action as { target?: Target }).target;
+  if (target) {
+    o.found = await targetResolves(page, storyboard, target);
   }
 }
 
@@ -985,17 +1714,34 @@ async function failAction(
   index: number,
   action: Action,
   opts: PlayerOptions,
-  err: unknown
+  err: unknown,
+  extra: { failedRequests: FailedRequest[] }
 ): Promise<never> {
   const prefix = `scene ${scene.id}, action #${index + 1} (${action.op})`;
   const base = err instanceof Error ? err.message : String(err);
+  // Lead with the app's own refusal when the action provoked a 4xx/5xx (issue
+  // #45): the selector headline blames the selector, and on a rate-limited or
+  // auth-gated flow the selector was fine — the write just failed. The
+  // original message stays, one line down, in parentheses.
+  const refusal = extra.failedRequests.filter((r) => (r.status ?? 0) >= 400).slice(-1)[0];
+  const headline = refusal
+    ? `the app refused a request this action triggered\n` +
+      describeFailedRequests([refusal]).join("\n").trim().replace(/^/, "  ") +
+      `\n  (${base})`
+    : base;
   let diag = "";
   if (opts.logsDir) {
-    diag = await dumpDiagnostics(page, storyboard, scene.id, index, action, opts.logsDir).catch(
-      () => ""
-    );
+    diag = await dumpDiagnostics(
+      page,
+      storyboard,
+      scene.id,
+      index,
+      action,
+      opts.logsDir,
+      extra.failedRequests
+    ).catch(() => "");
   }
-  throw new Error(`${prefix}: ${base}${diag ? `\n${diag}` : ""}`);
+  throw new Error(`${prefix}: ${headline}${diag ? `\n${diag}` : ""}`);
 }
 
 async function dumpDiagnostics(
@@ -1004,7 +1750,8 @@ async function dumpDiagnostics(
   sceneId: string,
   index: number,
   action: Action,
-  logsDir: string
+  logsDir: string,
+  failedRequests: FailedRequest[] = []
 ): Promise<string> {
   await ensureDir(logsDir);
   const stem = join(logsDir, `fail-${sceneId}-${index + 1}`);
@@ -1015,7 +1762,7 @@ async function dumpDiagnostics(
 
   // Selector diagnostics for targeted actions: how many widget frames (and the
   // main frame) currently match the selector we were after.
-  const target = "target" in action ? (action.target as Target) : undefined;
+  const target = (action as { target?: Target }).target;
   const selector = target?.named ? NAMED_SELECTORS[target.named] : target?.selector;
   const roots = widgetRootFrames(page);
   lines.push(`  widget frames present: ${roots.length}`);
@@ -1030,6 +1777,59 @@ async function dumpDiagnostics(
     lines.push(`    main frame: ${mainC} match(es) for "${selector}"`);
   }
 
+  // App-side failures in this action's window (issue #44): a backend 500 on
+  // the click's XHR is invisible in a screenshot and reads as a click miss.
+  if (failedRequests.length) {
+    lines.push(
+      `  failed requests since the previous action: ${failedRequests.length} ` +
+        `(an app-side write that failed reads as a click miss on screen)`
+    );
+    lines.push(...describeFailedRequests(failedRequests));
+  } else {
+    lines.push(`  failed requests since the previous action: none`);
+  }
+
+  // Drift suggestions: when the selector matched nothing, scan the page (and
+  // the widget frames) for the elements that look most like what it asked
+  // for, so the fix is one edit away instead of a round of guessing.
+  let drift: DriftCandidate[] = [];
+  let driftFile: string | null = null;
+  const nothingMatched =
+    !!selector && frameCounts.every((c) => c.matches <= 0) &&
+    ((await page.locator(selector).count().catch(() => 0)) === 0);
+  if (nothingMatched) {
+    const scanned: DriftCandidate[] = [];
+    const targets: Array<Page | Frame> = [page, ...roots];
+    for (const t of targets) {
+      const res = await scanInteractive(t, 120).catch(() => null);
+      if (!res) continue;
+      const frameTag = t === page ? undefined : truncateUrl((t as Frame).url());
+      scanned.push(
+        ...rankCandidates(selector!, res.elements, 8).map((c) =>
+          frameTag ? { ...c, frame: frameTag } : c
+        )
+      );
+    }
+    drift = scanned.sort((a, b) => b.score - a.score).slice(0, 8);
+    driftFile = join(logsDir, `drift-${sceneId}-${index + 1}.json`);
+    await fs
+      .writeFile(
+        driftFile,
+        JSON.stringify({ sceneId, actionIndex: index + 1, selector, url: page.url(), candidates: drift }, null, 2)
+      )
+      .catch(() => {});
+    if (drift.length) {
+      lines.push(`  nearest elements to "${selector}" (drift suggestions → ${driftFile}):`);
+      for (const c of drift.slice(0, 3)) {
+        lines.push(
+          `    ${c.role} "${c.name.slice(0, 40)}"${c.frame ? ` [frame ${c.frame}]` : ""} → ${c.selector || "(no unique selector)"}  (score ${c.score})`
+        );
+      }
+    } else {
+      lines.push(`  no similar interactive element on the page (drift file → ${driftFile}) — is this the right screen / state?`);
+    }
+  }
+
   const detail = {
     sceneId,
     actionIndex: index + 1,
@@ -1038,6 +1838,8 @@ async function dumpDiagnostics(
     url: page.url(),
     widgetFrames: frameCounts,
     allFrames: page.frames().map((f) => truncateUrl(f.url())),
+    failedRequests,
+    ...(driftFile ? { driftFile, driftCandidates: drift } : {}),
   };
   await fs.writeFile(`${stem}.json`, JSON.stringify(detail, null, 2)).catch(() => {});
   lines.push(`  detail → ${stem}.json`);
@@ -1110,6 +1912,112 @@ async function boxOf(page: Page, loc: Locator): Promise<{ cx: number; cy: number
   }
   if (!box) throw new Error("Element has no bounding box (not visible?)");
   return { cx: box.x + box.width / 2, cy: box.y + box.height / 2 };
+}
+
+/** Full viewport rect of an element (after boxOf's bring-into-view nudge). */
+async function rectOf(
+  page: Page,
+  loc: Locator
+): Promise<{ x: number; y: number; w: number; h: number }> {
+  await boxOf(page, loc);
+  const box = await loc.boundingBox();
+  if (!box) throw new Error("Element has no bounding box (not visible?)");
+  return {
+    x: Math.round(box.x),
+    y: Math.round(box.y),
+    w: Math.round(box.width),
+    h: Math.round(box.height),
+  };
+}
+
+/** CSS used for `hide` selectors (record-time, the one non-compose exception). */
+export function hideCss(selectors: string[]): string {
+  return selectors.length
+    ? `${selectors.join(",")}{visibility:hidden !important;}`
+    : "";
+}
+
+/** Install / replace the per-scene hide stylesheet in the main frame. */
+async function setSceneHide(page: Page, selectors: string[]): Promise<void> {
+  const css = hideCss(selectors);
+  await page
+    .evaluate((text) => {
+      const id = "__aidemo_scene_hide";
+      let el = document.getElementById(id);
+      if (!text) {
+        el?.remove();
+        return;
+      }
+      if (!el) {
+        el = document.createElement("style");
+        el.id = id;
+        document.documentElement.appendChild(el);
+      }
+      el.textContent = text;
+    }, css)
+    .catch(() => {});
+}
+
+/**
+ * Re-measure every redact selector and update the open spans: a box that
+ * moved or vanished closes its span; a new/moved box opens one. Cheap (one
+ * boundingBox per match), runs after every action.
+ */
+async function measureRedactions(
+  page: Page,
+  storyboard: Storyboard,
+  list: Redact[],
+  open: Map<string, RedactSpan>,
+  capture: SceneCapture,
+  now: () => number
+): Promise<void> {
+  const seen = new Set<string>();
+  const t = now();
+  for (const r of list) {
+    let boxes: Array<{ x: number; y: number; width: number; height: number } | null> = [];
+    try {
+      const loc = await resolveTargetLocator(page, storyboard, {
+        selector: r.selector,
+        ...(r.frame ? { frame: r.frame } : {}),
+      });
+      const n = Math.min(await loc.count().catch(() => 0), REDACT_MAX_MATCHES);
+      for (let i = 0; i < n; i++) {
+        boxes.push(await loc.nth(i).boundingBox().catch(() => null));
+      }
+    } catch {
+      boxes = [];
+    }
+    boxes.forEach((b, i) => {
+      if (!b || b.width < 1 || b.height < 1) return;
+      const key = `${r.frame ?? ""}>>${r.selector}#${i}`;
+      seen.add(key);
+      const rect = {
+        x: Math.round(b.x),
+        y: Math.round(b.y),
+        w: Math.round(b.width),
+        h: Math.round(b.height),
+      };
+      const cur = open.get(key);
+      const same =
+        cur &&
+        Math.abs(cur.x - rect.x) <= 2 &&
+        Math.abs(cur.y - rect.y) <= 2 &&
+        Math.abs(cur.w - rect.w) <= 2 &&
+        Math.abs(cur.h - rect.h) <= 2;
+      if (same) return;
+      if (cur) {
+        cur.endMs = t;
+        capture.redactSpans.push(cur);
+      }
+      open.set(key, { startMs: t, endMs: t, ...rect, blur: r.blur ?? 14 });
+    });
+  }
+  for (const [key, span] of open) {
+    if (seen.has(key)) continue;
+    span.endMs = t;
+    capture.redactSpans.push(span);
+    open.delete(key);
+  }
 }
 
 /** Eased cursor glide via many small mouse.move steps. */

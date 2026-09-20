@@ -1,6 +1,7 @@
 import { resolve, isAbsolute } from "node:path";
 import { StoryboardSchema, type Storyboard } from "./types.js";
 import { applyParams } from "./params.js";
+import { applyAnchors } from "./anchors.js";
 import { ensureDir, exists, readJson, writeJson, log } from "./util.js";
 
 /**
@@ -118,6 +119,14 @@ export class Project {
   }
   get gifPath() {
     return this.p("output", this.lang ? `final-demo.${this.lang}.gif` : "final-demo.gif");
+  }
+  /** Structured compose report (per-scene retime facts + warnings). */
+  get posterPath() {
+    return resolve(this.dir, "output", this.lang ? `poster.${this.lang}.png` : "poster.png");
+  }
+
+  get reportPath() {
+    return this.p("output", this.lang ? `report.${this.lang}.json` : "report.json");
   }
   /** Directory for screenshot-mode stills (one PNG per named `still` marker). */
   get stillsDir() {
@@ -265,11 +274,12 @@ export function parseStoryboard(
       issues: [{ path: "params", message: applied.message, code: "params" }],
     };
   }
+  const storyboard = applyAnchors(applied.storyboard);
   return {
     ok: true,
-    storyboard: applied.storyboard,
+    storyboard,
     resolved: applied.resolved,
-    warnings: storyboardWarnings(applied.storyboard),
+    warnings: storyboardWarnings(storyboard),
   };
 }
 

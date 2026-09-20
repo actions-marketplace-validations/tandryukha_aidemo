@@ -86,6 +86,35 @@ on npm). The `release.yml` npm step is a no-op while `NPM_PUBLISH` is unset.
 `mcp-publisher login github` → `mcp-publisher publish`. Bump `version` in
 `server.json` on each release you want listed.
 
+## Homebrew tap
+
+The tap lives in its own repo, **`tandryukha/homebrew-aidemo`**, and its formula
+(`Formula/aidemo.rb`) points at the **npm** tarball — so a tap bump is only
+possible once npm publishing is on (`NPM_PUBLISH=true`).
+
+The tap **bumps itself**: `.github/workflows/bump.yml` in that repo runs daily
+(06:17 UTC), reads the latest version off the npm registry and rewrites `url` +
+`sha256` using its own `GITHUB_TOKEN` — no cross-repo PAT, nothing to configure
+here. Nothing automated this before, which is how the tap sat on 0.8.0 through
+v0.14.0 (issue #45).
+
+To pull it forward immediately after a release instead of waiting for the cron:
+
+```bash
+gh workflow run bump.yml -R tandryukha/homebrew-aidemo
+```
+
+**Verify after a release:** `npm view @tandryukha/aidemo version` and
+`grep sha256 -B1 Formula/aidemo.rb` in the tap should both read the new version.
+Manual fallback, if the step was skipped:
+
+```bash
+v=X.Y.Z
+url="https://registry.npmjs.org/@tandryukha/aidemo/-/aidemo-$v.tgz"
+sha=$(curl -fsSL "$url" | shasum -a 256 | cut -d' ' -f1)
+# edit Formula/aidemo.rb url + sha256, commit, push
+```
+
 ## Caveat: npm caches moving tags
 
 `npx ...#stable` resolves the `stable` ref to a commit each run, but npm caches

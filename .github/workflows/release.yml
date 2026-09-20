@@ -82,3 +82,8 @@ jobs:
           npm install -g npm@latest >/dev/null 2>&1   # OIDC trusted publishing needs npm >= 11.5.1
           npm publish --provenance --access public
           echo "::notice::published $name@$v to npm"
+
+      # Homebrew tap: the tap repo (tandryukha/homebrew-aidemo) bumps its own
+      # formula from npm on a daily schedule with its own GITHUB_TOKEN — no
+      # cross-repo PAT here. To pull it forward right after a release:
+      #   gh workflow run bump.yml -R tandryukha/homebrew-aidemo

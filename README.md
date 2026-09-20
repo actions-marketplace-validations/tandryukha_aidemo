@@ -23,7 +23,7 @@ demo.
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/tandryukha/aidemo/badge)](https://scorecard.dev/viewer/?uri=github.com/tandryukha/aidemo)
 [![Glama](https://glama.ai/mcp/servers/tandryukha/aidemo/badges/score.svg)](https://glama.ai/mcp/servers/tandryukha/aidemo)
 
-**Install:** Claude Code `/plugin marketplace add tandryukha/aidemo` · CI `uses: tandryukha/aidemo@stable` · CLI `npx -y @tandryukha/aidemo` · Homebrew `brew install tandryukha/aidemo/aidemo`
+**Install:** Claude Code `/plugin marketplace add tandryukha/aidemo` · any agent `npx skills add tandryukha/aidemo` (skill only; add the MCP server with `repo-init`) · CI `uses: tandryukha/aidemo@stable` · CLI `npx -y @tandryukha/aidemo` · Homebrew `brew install tandryukha/aidemo/aidemo`
 <br>Published on the [GitHub Marketplace](https://github.com/marketplace/actions/aidemo-demo-video), [npm](https://www.npmjs.com/package/@tandryukha/aidemo), a [Homebrew tap](https://github.com/tandryukha/homebrew-aidemo), and the [MCP Registry](https://registry.modelcontextprotocol.io).
 
 [![aidemo demoing itself on Wikipedia — recorded with aidemo](docs/demo.gif)](https://github.com/tandryukha/aidemo/releases/download/v0.3.0/wikipedia-showcase-demo.mp4)
@@ -175,19 +175,27 @@ re-recording, recompose without re-transcribing, etc.
 
 ```bash
 aidemo init <name>            # scaffold demos/<name>/ with a starter storyboard
+aidemo init <name> --from-url <url>   # …drafted from the live page's headings + real selectors
+aidemo import-trace trace.zip --name <name>   # …or from a Playwright trace / *.spec.ts (actions + selectors → scenes)
 aidemo voice   <dir>          # per-scene TTS → narration.mp3 + voice.json
 aidemo record  <dir>          # drive Chrome → raw video + timeline.json
 aidemo probe   <dir>          # record-only dry run (verify selectors), no key needed
+aidemo validate <dir>         # schema-check the storyboard, no browser (non-zero exit on issues)
+aidemo lint    <dir>          # predict freezes/cuts + selector pitfalls before spending a take
 aidemo captions <dir>         # Whisper → captions.{srt,vtt,cues.json} (--offline for no network)
 aidemo compose <dir>          # trim + sync + zoom + cards + caption + mux → final-demo.mp4
 aidemo gif     <dir>          # final-demo.mp4 → README-ready GIF (autoplays on GitHub)
+aidemo frames  <dir>          # evenly spaced PNGs from the video for review (--source raw)
 aidemo render  <dir>          # voice → record → captions → compose
 aidemo guide                  # print the canonical authoring guide
 aidemo doctor                 # check Node, ffmpeg, Chrome, voice endpoint
 ```
 
 Add `--headless` for CI/fixtures; omit it for real sites that need your
-logged-in session. `--profile <dir>` picks the Chrome user-data dir;
+logged-in session. `--profile <dir>` picks the Chrome user-data dir; `--fresh`
+records on a wiped one; `--storage-state <file>` / `--cookie "name=value;domain=host"`
+seed a cookie-gated site before the first action (or declare `setup` in the
+storyboard, which can also run a `preflight` script before every take);
 `--capture native|obs` switches to high-fidelity screen capture. `voice`/`render`
 **skip TTS for unchanged scenes**, and `record` **salvages a failed take** (keeps
 the footage + drops a screenshot/frame-dump in `logs/`).
@@ -268,7 +276,7 @@ demos/<name>/          ← your working area (untracked; scaffold with `aidemo i
   fully local. The MCP server is **stdio-only** — no listener.
 - **Small, auditable surface:** ~20 source files, 7 runtime deps, MIT. Pin an
   immutable ref if you're wary of the moving `#stable` tag:
-  `npx -y github:tandryukha/aidemo#v0.8.0`.
+  `npx -y github:tandryukha/aidemo#v0.14.0` (any released tag).
 - Full detail: [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md#what-leaves-the-machine)
   · report vulnerabilities privately per [SECURITY.md](SECURITY.md).
 

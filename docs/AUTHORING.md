@@ -5,8 +5,9 @@ producing a demo video with aidemo. It is served by the engine itself, so it
 always matches the engine that will render:
 
 - **MCP** (preferred for agents): call the `get_authoring_guide` tool on the
-  `aidemo` MCP server — it returns this document.
-- **CLI**: `aidemo guide` prints it.
+  `aidemo` MCP server — it returns this document (pass `topic` — `core`,
+  `schema`, `attention`, `polish`, `chatgpt-apps`, `debug`… — for one slice).
+- **CLI**: `aidemo guide` prints it (`--topic core` / `--list` for a slice).
 
 You are the **demo director**: turn a feature + loose directions into a
 polished 30–60s narrated, captioned browser-demo MP4. You author the
@@ -24,14 +25,19 @@ Every operation exists on both surfaces. Agents should prefer the MCP server
 |---|---|---|
 | Read this guide | `get_authoring_guide` | `aidemo guide` |
 | Storyboard JSON Schema | `get_storyboard_schema` | — (see below) |
-| Validate a storyboard | `validate_storyboard` | (validated on every run) |
-| Scaffold a demo | `init_demo` | `aidemo init <name>` |
+| Validate a storyboard | `validate_storyboard` | `aidemo validate <dir>` (or `--file <path>`; `--json`) |
+| Lint / pacing forecast (no browser) | `lint_storyboard` | `aidemo lint <dir>` (`--file`, `--lang`, `--json`, `--strict`) |
+| Scaffold a demo | `init_demo` (`fromUrl` drafts from a live page) | `aidemo init <name> [--from-url <url>]` |
+| Draft from a Playwright trace / test | `import_trace` | `aidemo import-trace <trace.zip \| spec.ts> --name <name>` |
 | Environment check | `doctor` | `aidemo doctor` |
+| Discover selectors on a page | `inspect` (job) | `aidemo inspect <url> [--dir <dir>] [--frame name=sel]` |
 | Dry-run the flow | `probe` (job) | `aidemo probe <dir>` |
 | Full pipeline | `render` (job) | `aidemo render <dir>` |
 | One stage | `voice` / `record` / `captions` / `compose` (jobs) | `aidemo voice\|record\|captions\|compose <dir>` |
 | README GIF | `gif` (job) | `aidemo gif <dir>` |
 | Named stills (screenshot mode) | `stills` (job) | `aidemo stills <dir>` |
+| Frames for review | `frames` (job) | `aidemo frames <dir> [--every 3] [--source raw\|take]` |
+| Walkthrough export (HTML + Markdown + frames + captions) | `walkthrough` (job) | `aidemo walkthrough <dir> [--lang] [--width]` |
 | Job progress / result | `job_status`, `job_list`, `job_cancel` | (CLI runs block in the foreground) |
 
 **The job model (MCP).** Pipeline operations touch TTS/STT, a real Chrome, or
@@ -47,9 +53,37 @@ instead.
 **Always pass absolute demo directories** to MCP tools — the server's working
 directory is not necessarily your repo (Codex registers servers globally).
 
-**Validate early.** Run `validate_storyboard` after every storyboard edit
-(cheap, structured errors) instead of discovering schema issues inside a
-render job.
+**Validate early.** Run `validate_storyboard` (CLI: `aidemo validate <dir>`,
+non-zero exit on issues) after every storyboard edit — cheap, structured
+errors — instead of discovering schema issues inside a render job.
+
+**Inspect before you write a target.** `inspect {dir, url}` (CLI: `aidemo
+inspect <url> --dir <dir>`) opens the page in the recording profile (so a
+logged-in app shows its real UI), waits for it to settle, and returns every
+visible interactive element — role, name, whether it's in the viewport — with
+a ranked list of selectors that are **unique on that page right now**
+(`[data-testid=…]` → `#id` → `[aria-label=…]` → `button:has-text("…")` →
+`input[name=…]`/`[placeholder=…]` → `tag.class` → a short structural path),
+plus the headings and any iframes (for the `frames` block; pass `frames` to
+scan inside them). Use it instead of reading source or guessing: copy the
+first selector of the element you mean. It writes `logs/inspect-<ts>.json`
+and a screenshot next to it. Elements below the fold are listed too (marked
+`↓` on the CLI); a `scrollTo` on them works as usual.
+
+**Lint before you spend a take.** `lint_storyboard` (CLI: `aidemo lint <dir>`)
+is a browser-free preflight that predicts what compose will do to each scene:
+it estimates the action time from the ops (a `type` at human speed, a scroll's
+easing, a `pause`, a `goto`) and compares it with the narration's word count at
+the language's speaking rate. A scene whose actions finish long before the
+voice does will be **held on a frozen frame** (`[scene-freeze]`, with the
+predicted hold %); one whose actions run far past the voice will be **sped up
+to the x1.6 ceiling and cut** (`[overrun-cut]`). It also flags the classic
+selector/wait pitfalls (`type`+`Enter` with no wait behind it, `:text-is` on a
+nested label, `focus` with no `zoom` block, an anchored `waitForChange` regex,
+a scene that opens with a navigation click, `music.cue` no-ops). `validate`
+prints the same findings; probe/record/render run it automatically (non-fatal)
+so the forecast is in the log next to the take. The same numbers come back
+**measured** in `output/report.json` after compose (see "Verify").
 
 ## Pipeline (what the engine does)
 
@@ -70,7 +104,16 @@ network.
    one thing to prove, audience, tone, length, CTA. Otherwise infer sensible
    defaults.
 2. **Scaffold**: `init_demo` / `aidemo init <name>` → creates `demos/<name>/`
-   with a starter `generated/storyboard.json`.
+   with a starter `generated/storyboard.json`. When you already know the URL,
+   pass `fromUrl` (`--from-url`): the engine inspects the page first and the
+   draft uses its **real** headings as scenes and its **real** unique selectors
+   as beats (search box → `type`, first CTA → a `hover` you turn into the
+   click), with everything else it saw in `_candidates` and `input/brief.md`.
+   Repeated heading text gets an explicit `nth=`, and a page with no headings
+   at all (a single-page app that paints its own layout) drafts scroll beats
+   instead, so the skeleton still shows how long the page is. No LLM runs — you
+   still write the narration and choose the flow; you just never start from
+   `#search` placeholders.
 3. **Confirm selectors for a new/changed flow.** Don't guess. The cheapest way
    is a **probe** — a record-only dry run (narration optional) that drives the
    real flow in ~90 s without spending TTS or a full take, so you can verify
@@ -78,7 +121,10 @@ network.
    `storyboard.frames`. A probe that hits a bad selector leaves a screenshot +
    frame dump in `logs/` (surfaced as `failureArtifacts` in `job_status`).
 4. **Write the storyboard** (schema + principles below), then
-   `validate_storyboard`.
+   `validate_storyboard` and `lint_storyboard` — fix every `[scene-freeze]` /
+   `[overrun-cut]` the lint predicts *before* paying for voice: add on-screen
+   beats (hover, scroll, focus, a `pause`) to a scene that is all narration, or
+   trim the narration of a scene that is all action.
 5. **Render**: run the `render` job (headed for real ChatGPT: keep
    `headless: false` / drop `--headless`). Then inspect `output/final-demo.mp4`
    — extract a few frames with ffmpeg and look at them.
@@ -89,7 +135,8 @@ network.
    `compose` — voice **skips unchanged scenes** (hashes narration + voice
    plan), so only the edited scene is re-voiced and an approved take is
    preserved (`force` re-voices all; `scene <id>` targets one). Re-record only
-   if the browser flow changed.
+   if the browser flow changed — and then only from the first changed scene
+   (`record --from-scene <id>` / `fromScene`): earlier scenes keep their take.
 
 ## Demo-director principles (make it feel human-made)
 
@@ -121,17 +168,47 @@ network.
   `AIDEMO_TTS_PROVIDER=elevenlabs`; a Kokoro voice id — af_heart, am_adam, … —
   if it runs with `AIDEMO_TTS_PROVIDER=local`; both non-default providers
   ignore `instructions`) and `instructions` to steer tone/emotion/pace. Keep it
-  consistent across scenes.
+  consistent across scenes. **`voice.pronounce`** (`{"aidemo":"A.I. demo",
+  "SQL":"sequel"}`, whole-word, case-sensitive, storyboard-level or per
+  scene) rewrites only what the TTS *hears* — the narration text, and so the
+  captions, keep the written form. Use it for product names, acronyms, and
+  version strings the voice mangles.
 
 ## Storyboard schema (quick reference)
 
 The precise contract is the JSON Schema from `get_storyboard_schema`
 (generated from the engine's own zod schema, `src/types.ts`).
 
-Top level: `title`, `language?`, `targetLengthSeconds?`, `video{width,height}`
+Top level: `title`, `language?`, `knownTerms?`, `targetLengthSeconds?`, `video{width,height}`
 (default 1280x720), `frames{ name: iframeSelector }`,
-`voice{voiceId,instructions,speed}` (default, scenes may override), `music?`,
-`zoom?`, `intro?`, `outro?`, `transition?`, `output?`, `scenes[]`.
+`voice{voiceId,instructions,speed,pronounce?}` (default, scenes may override), `music?`,
+`zoom?`, `intro?`, `outro?`, `transition?`, `hold?`, `output?`, `setup?`,
+`attention?`, `keystrokes?`, `captions?`, `redact?`, `hide?`, `frame?`,
+`brand?`, `scenes[]`.
+
+`setup?` prepares the take before the first action — for cookie-gated or
+fixture-rotating sites, so you never hand-write a Playwright seed script:
+- `storageState`: path (relative to the demo dir) to a Playwright storageState
+  JSON (`{cookies:[…], origins:[{origin, localStorage:[{name,value}]}]}`, e.g.
+  saved by `context.storageState({path})`). Its cookies are added to the
+  profile and each origin's localStorage entries set before the storyboard
+  runs. CLI/MCP: `--storage-state <file>` / `storageState`.
+- `cookies: [{name, value, domain, path?, secure?, httpOnly?, sameSite?,
+  expires?}]` — add cookies directly. CLI: `--cookie "name=value;domain=host"`
+  (repeatable, DevTools-style attributes; MCP: `cookies`).
+- `preflight`: a shell command run from the demo dir before **every** take
+  (record/probe/render), after the profile is resolved and before Chrome
+  launches — "resolved" means the path is computed (and already wiped when
+  `--fresh`), with no browser holding it, so the hook may safely delete,
+  re-create and seed that directory — re-seed a fixture, or patch this storyboard for whichever variant
+  the app serves today (the storyboard is **re-read after the hook**). Env:
+  `AIDEMO_DEMO_DIR`, `AIDEMO_STORYBOARD`, `AIDEMO_PROFILE`. Non-zero exit
+  aborts the take with the hook's output.
+- `expectState: true` — the profile is seeded on purpose; silence the
+  carried-over-state warning (implied by `storageState`/`cookies`; CLI/MCP:
+  `--profile-seeded` / `profileSeeded`).
+Seeding composes with `--fresh`: the wipe happens first, then the seeds go in
+— a clean identity that still carries exactly the cookie the gate needs.
 
 `language?` is a BCP-47/ISO-639-1 code (e.g. `"et"`) describing what language
 the base `narration` is already written in — set it for a monolingual
@@ -140,11 +217,20 @@ render switch: it only feeds the `captions` STT language hint (see below).
 Distinct from `--lang`, which *selects* a scene's `narrations[code]`
 translation (Multi-language renders, below).
 
+`knownTerms?: string[]` is a glossary of product names, brands and jargon
+Whisper reliably mis-hears (`["fitness.ee", "aidemo", "MaxFit"]`). They are
+sent at the *front* of the STT prompt — Whisper only biases on roughly its
+first 224 tokens, so a term buried in a long script never reaches it. Cheaper
+than `captions --offline`, which fixes spelling but gives up real word timing.
+
 Cinematic keys (all opt-in; omit for the plain look):
 - `zoom: {scale?=1.55, easeMs?=600, holdMs?=1700}` — **auto-zoom on focus**:
   every click/typed prompt zooms in on the interaction point at compose time,
   holds, eases out; near-consecutive focus points pan instead of bouncing.
-  Set `"zoom": false` on a scene to opt just that scene out.
+  Set `"zoom": false` on a scene to opt just that scene out. On narrow
+  (mobile) viewports `scale` is capped so a zoom always leaves ≥360 logical px
+  of the page in frame — a desktop-tuned 1.35x otherwise crops a 430px take's
+  headline off the edge. Compose logs the cap when it applies.
 - `intro` / `outro: {title, subtitle?, durationMs?=2600, background?, accent?,
   fadeMs?=350}` — typographic title cards; narration/captions shift
   automatically and music runs under the cards.
@@ -160,16 +246,59 @@ Cinematic keys (all opt-in; omit for the plain look):
   `output.loudness` (see below).
 - `transition: {type:"crossfade", durationMs?=400}` — **cross-dissolve every
   scene boundary** instead of hard-cutting (see below).
+- `hold: {mode?="freeze"|"drift", driftScale?=1.06, backoffMs?=0}` — what a
+  scene shows while the narration outlasts its actions: a frozen frame
+  (default) or a **slow Ken-Burns drift** so it never reads as a stall (see
+  below).
 - `output: {width?, height?, fit?="contain", background?, loudness?}` — **render
   at a different size/aspect** (`width`+`height`, set together) and/or **set the
   master loudness** (`loudness`), e.g. a vertical social clip (see below).
 - `motionBlur: {frames?=3}` — **subtle motion blur** on fast motion (cursor,
   scroll, zoom pan); static UI stays sharp (see below).
-- `cursor: {hidden?, hideScenes?, scale?}` — **compose-time cursor control**:
-  hide or resize the cursor post-hoc instead of baking it (see below).
+- `cursor: {hidden?, hideScenes?, scale?, style?, color?}` — **compose-time
+  cursor control**: hide, resize or restyle (`"arrow"` | `"dot"`) the cursor
+  post-hoc instead of baking it (see below).
+- `attention: {color?, clicks?}` — accent color for highlight/spotlight/callout
+  overlays; `clicks:true` draws a click ring wherever a click lands (needs the
+  `cursor` block). See *Attention*.
+- `keystrokes: true` — show a keystroke chip ("⌘ K", "Enter") on every `press`
+  (per-action `keystrokes` overrides). See *Attention*.
+- `captions: {position?="bottom"|"top", style?="pill"|"bar"|"none", font?,
+  size?, color?, background?}` — caption strip placement and look; scenes may
+  override `position` with their own `captions`. Compose also auto-flips a cue
+  to the top while an overlay occupies the bottom band. See *Attention* and
+  *Produced look*.
+- `redact: [{selector, frame?, blur?}]` — **blur regions at compose time**
+  (prices, emails, tokens); scenes may add their own `redact`. See *Attention*.
+- `hide: [selector, …]` — hide elements at **record** time (teasers, cookie
+  bars, ad slots); scenes may add their own `hide`. See *Attention*.
+- `frame: {padding?, background?, radius?, shadow?, chrome?="none"|"browser"|"mac",
+  safeTop?, title?, url?}` — pad the video onto a styled canvas with a rounded,
+  shadowed window and optional browser chrome. See *Produced look*.
+- `brand: {logo?, accent?, font?, watermark?}` — brand kit: accent for cards /
+  frame tint / attention overlays, font for cards + captions + callouts +
+  chrome, logo on cards and as a watermark. See *Produced look*.
+- `autoIdle: true | {enabled?, minMs?=1500, noise?=0.003}` — **trim dead air
+  compose was never told about**: it scans the take for spans where nothing on
+  screen moves and caps them like an annotated wait, so a slow XHR or a long
+  `pause` stops inflating the scene. Opt-in; per-scene `autoIdle` overrides it
+  (`false` protects a scene that is deliberately still). Detected spans show up
+  as `autoIdleMs` per scene in `output/report.json`. Annotating the wait
+  (`waitForChange {idle:true}`, `waitForWidget`) is still better — it says WHY
+  the pause exists and lint can forecast it; `autoIdle` is the safety net for
+  waits you can't annotate. It only ever caps still footage, so a scene that is
+  deliberately motionless (a held product shot) wants `autoIdle: false`.
+- `output: {preset?, chapters?, poster?, walkthrough?, width?, height?, fit?,
+  loudness?}` — presets `youtube|short|readme-gif|x`, MP4 chapter markers
+  from scene `title`s, `output/poster.png`, the walkthrough bundle. See
+  *Produced look* and *Transitions*.
 
-Each scene: `id`, `narration`, `voice?`, `music?`, `zoom?` (false to disable),
-`actions[]`.
+Each scene: `id`, `title?` (chapter name), `narration`, `voice?`, `music?`,
+`zoom?` (false to disable), `autoIdle?` (overrides the top-level setting),
+`captions?`, `redact?`, `hide?`, `actions[]`.
+Narration may carry `{{@name}}` anchor markers (see *Narration-anchored
+beats*); the engine strips them at load and keeps the word index on the
+scene as `anchors` (don't author that field).
 
 ## Transitions, output sizing & loudness
 
@@ -187,6 +316,20 @@ are identical to the hard-cut version — only the cuts become dissolves. Cost: 
 scene join is re-encoded (the default hard-cut path is a lossless stream-copy
 concat). Needs ≥2 scenes; a shorter `durationMs` (250–400) reads as a snappy
 dissolve, longer (600+) as a slow cinematic fade.
+
+**`hold: {mode?, driftScale?, backoffMs?}`** — controls the **hold** compose
+adds when a scene's narration runs longer than its (already x1.6-slowed)
+recording. By default the last frame is frozen for the remainder
+(`mode:"freeze"`, byte-identical to earlier versions). `mode:"drift"` replaces
+the freeze with a slow, eased push-in on that frame (`driftScale`, 1–1.5,
+default 1.06 ≈ 6% over the hold) — motion that reads as intentional rather
+than a stalled screen. `backoffMs` (0–2000) takes the held frame from that
+many ms *before* the scene's end instead of the very last frame, so a hold
+never lands on a half-drawn transition, a spinner, or a white flash at the
+tail of a navigation. Only scenes that actually hold are affected; a scene
+whose actions fill the narration is untouched, and a scene with no hold is
+byte-identical. The compose log and `output/report.json` list every scene's
+hold length and percentage; the lint predicts them before the take.
 
 **`output: {width, height, fit?, background?}`** — reframes the finished video
 (cards and captions already baked in) to a target size, applied as the last
@@ -222,6 +365,202 @@ Override or disable via `loudness`:
 Targets are the ffmpeg `loudnorm` `I` (LUFS), `TP` (dBTP), and `LRA` (LU). The
 pass runs last over the muxed audio and pins the rate back to 44.1 kHz.
 
+## Narration-anchored beats (`{{@name}}` + `anchor`)
+
+By default compose stretches a whole scene by one factor so its take fills
+the narration. That keeps things in sync on average, but the click you care
+about still lands wherever the recording put it — often a second before or
+after the word that describes it. Anchors pin a beat to a word:
+
+```json
+{
+  "id": "s3",
+  "narration": "Add the one you want, and it {{@drop}}drops straight into your basket.",
+  "actions": [
+    { "op": "pause", "ms": 1200 },
+    { "op": "click", "target": { "selector": "[data-testid=add-to-cart]" }, "anchor": "drop" }
+  ]
+}
+```
+
+- Write `{{@name}}` immediately before the word the beat should land on
+  (`[\w.-]+` names; the marker is stripped before TTS, captions and lint, so
+  the narration reads and sounds unchanged). Put `anchor: "name"` on the
+  action — a click, type, press, scrollTo, hover, or an attention beat. The
+  moment used is the click/press itself (the focus event), not the cursor
+  glide before it.
+- Compose then retimes the scene **piecewise**: each stretch between anchors
+  gets its own factor so the action plays exactly as the word is spoken, and
+  the remainder of the scene fills the narration as before. Every piece stays
+  within the usual x0.5–x1.6 limits — if the beat still can't be reached, the
+  render succeeds and reports **`anchor-unreachable`** with the miss in ms
+  (`report.json` → scene `anchors[]`: `targetMs`, `landedMs`, `offMs`). The
+  fix is authoring: give the action more lead-in (a `pause` before it) when
+  it lands early, or trim what happens before it (mark waits idle, move the
+  marker later) when it lands late.
+- Several anchors per scene are fine (`{{@add}} … {{@checkout}}`); they must
+  be in the same order as their actions. One marker per action; lint flags a
+  marker without an action (`anchor-unused`), an action without a marker
+  (`anchor-missing`) and a name reused on two actions (`anchor-duplicate`).
+- Scenes without anchors are untouched (the single-piece path is the exact
+  pre-anchor arithmetic), so adding one anchor never shifts another scene.
+- Multi-language: put markers in each `narrations[lang]` string too; the
+  engine keeps a per-language word index, so the beat lands on the translated
+  word.
+- With STT captions the word time comes from the transcript (matched to the
+  script by normalized token, falling back to the proportional position); with
+  script-timed captions it comes from the same length-weighted model the
+  captions use. Re-run `captions` after changing a narration so the anchor
+  reads fresh timings.
+
+## Attention: highlight, spotlight, callout, keystrokes, redact, hide
+
+The attention layer is how a demo says *look here* without a voice-over
+"as you can see". Everything except `hide` is **compose-time**: the player
+measures the element's box during the take and logs a timeline marker; compose
+rasterizes the mark (headless-Chrome PNG, baseline `overlay`) and draws it
+**under the cursor and before the zoom**, so it rides the camera like page
+content. Restyle, retime or remove a mark → recompose, never re-record. Every
+key is opt-in; a storyboard without them renders exactly as before.
+
+**Beats (actions):**
+- `{op:"highlight", target, holdMs?=1600, style?}` — an outline around the
+  element. `style: {color?, thickness?=3, padding?=6, shape?="box"|"ring"}`.
+- `{op:"spotlight", target, holdMs?=1600, dimTo?=0.55, padding?=10, style?}` —
+  dims the whole frame except the element (with a thin accent edge).
+- `{op:"callout", target, text, placement?="auto"|"top"|"bottom"|"left"|"right",
+  holdMs?=2000, style?}` — a short label (≤80 chars) pinned to the element
+  with an arrow. `auto` picks below, then above, then right.
+
+Each beat **dwells** at record time for `min(holdMs, 800)` ms so the eye
+registers it before the next action; the overlay itself stays for `holdMs` of
+*content* time (clipped to the scene). Pair a beat with the narration that
+names the thing: `highlight` the field right before you `type` into it,
+`spotlight` the result the narration explains, `callout` the one number that
+matters. Don't stack more than one beat per sentence.
+
+**Keystroke chips.** `keystrokes: true` (top level) or `keystrokes: true` on a
+`press` shows a chip bottom-right ("⌘ K", "Enter", "Esc", "⇧ Tab") for ~0.9 s
+after the key goes down. Shortcuts-driven products (command palettes, editors)
+read far better with it; typing (`type`) never shows chips — the text on
+screen is the feedback.
+
+**Click rings.** `attention: {clicks: true}` with a `cursor` block draws a
+three-step ring where every click lands (the compose-time twin of the baked
+cursor's ripple). `attention.color` sets the accent for rings and beats
+(default `#ff5a5f`).
+
+**Cursor style.** `cursor: {style:"dot", color?, scale?}` draws a soft dot
+instead of the arrow — the screen-recorder look; the dot is centered on the
+recorded point, the arrow's tip is.
+
+**Captions placement.** `captions: {position:"top"}` (top level or per scene)
+moves the strip to the top edge. Without a per-scene override, compose
+**auto-flips** any cue whose window overlaps a highlight/spotlight/callout
+box or a keystroke chip sitting in the bottom band, so a mark and a caption
+never collide (`report.json` → `attention.captionsFlipped`).
+
+**Redact (compose-time blur).** `redact: [{selector, frame?, blur?=14}]` at
+the top level and/or per scene. After every action the player re-measures
+each selector (all matches, up to 8) and logs a span per box; compose crops,
+blurs and overlays each span back — prices, emails, API keys, customer names
+never ship, and the blur strength is a recompose. Boxes that move (scrolls,
+re-layouts) start a new span at the next action; a region that moves *during*
+a scroll is blurred at its post-scroll position, so put the scroll before the
+data appears or blur a container rather than a cell.
+
+**Hide (record-time).** `hide: ["footer", ".promo-banner"]` at the top level
+(injected before any page script, survives navigations) and/or per scene
+(applied at scene start, removed at scene end) sets `visibility:hidden` on
+the matches — for teasers, chat widgets, cookie bars, and ad slots that would
+photobomb the take. This is the **one** record-time exception to
+compose-time polish: hiding is cheap to redo, and a hidden element cannot be
+un-hidden by a recompose, so keep the list to things you'd never want in any
+cut. Lint-check with a probe: hidden elements still take their layout space.
+
+## Produced look: frame, brand, caption styles, presets, chapters, poster
+
+Everything here is compose-time and opt-in — a storyboard without these keys
+renders exactly as before, and every tweak is a recompose. Frame and cards
+are headless-Chrome-rasterized PNGs over core `pad`/`overlay` filters, so the
+look is portable across ffmpeg builds. Read the report (`output/report.json`)
+and `aidemo frames` after the first render with a frame: the canvas is bigger
+than the recording, so check that captions and chips sit where you expect.
+
+**`frame`** — the "Screen Studio" look: the recording becomes a rounded,
+shadowed window on a styled canvas, with captions in the padding band below.
+```json
+"frame": { "chrome": "mac", "url": "app.example.com", "padding": 56, "radius": 14 }
+```
+- `padding` (default 48, logical px) grows the canvas on every side; the
+  canvas is `(width + 2·padding) × (height + 2·padding [+ 40 chrome])`. With
+  `output.preset`/`width`/`height` set, the padding grows on one axis so the
+  canvas already has the target aspect — the resize is a pure scale, never
+  letterbox bars around the frame.
+- `background`: any CSS color/gradient. Default: a dark gradient tinted with
+  `brand.accent` when set.
+- `radius` (default 14), `shadow` (default true).
+- `chrome`: `"browser"` (neutral dots + address pill) or `"mac"` (traffic
+  lights). `url` (wins) or `title` fills the pill; omit both for an empty bar.
+  For a phone-sized take (`video: {width: 390, height: 844}` — record at the
+  mobile viewport) use `"iphone"` (rounded bezel + dynamic island) or
+  `"android"` (bezel + punch-hole): no bar, `radius` defaults to 40, and the
+  camera cut-out sits over the top of the video, so keep the app's own status
+  bar area clear or accept it being covered. Pair with `output.preset:
+  "short"` for a 9:16 export — the padding grows to fill the aspect.
+- Zoom, cursor, attention overlays and redaction all happen **before** the
+  frame, so they ride inside the window; captions, keystroke chips, cards and
+  the watermark render at the canvas size.
+
+**`brand`** — one place for identity, applied everywhere it should show:
+```json
+"brand": { "logo": "brand/logo.png", "accent": "#3b82f6", "font": "Inter, sans-serif",
+           "watermark": { "position": "bottom-right", "opacity": 0.85, "scale": 0.11 } }
+```
+- `accent` → intro/outro rule color (unless the card sets its own), the frame
+  gradient tint, and the default attention color (`attention.color` wins).
+- `font` → cards, captions (`captions.font` wins), callouts, frame chrome. Use
+  a family that exists on the render machine; the fallback is the system sans.
+- `logo` (png/svg/jpg, relative to the demo dir): drawn above the rule on
+  intro/outro cards and, unless `watermark.enabled:false`, as a watermark over
+  the content at `position` with `opacity` (0–1) and `scale` (fraction of the
+  frame width, default 0.11). A missing file is a compose warning
+  (`brand-logo-missing`), not a failure.
+
+**Caption styles** (`captions`, top level): `style` is `"pill"` (default —
+centered rounded box), `"bar"` (full-width band flush with the frame edge; the
+usual choice under a `frame`), or `"none"` (no captions burned — the
+SRT/VTT files are still written, for players and platforms that render their
+own). `font`, `size` (default 30, logical px), `color`, `background` (any
+CSS) restyle the strip; `position` still flips per scene / automatically.
+
+**Output presets** (`output.preset`) fill `width`/`height`/`fit` when you
+don't set them explicitly: `youtube` 1920×1080, `short` 1080×1920,
+`readme-gif` 960×540, `x` 1280×720 — all `fit:"contain"` (letterbox, never
+crop). Explicit `width`/`height`/`fit` win over the preset.
+
+**Chapters** (`output.chapters: true`): the MP4 gets one chapter marker per
+scene at its content start (after the intro card), named from the scene's
+`title` (or its `id`). YouTube, QuickTime, VLC and mpv show them as a
+navigable table of contents. Give every scene a short `title` when you turn
+this on.
+
+**Walkthrough** (`output.walkthrough: true` — honoured by `render` *and* by a
+standalone `compose` — or `aidemo walkthrough <dir>` / the `walkthrough` job any
+time after a render): one take → several
+artifacts in `output/walkthrough/`: `index.html` (one card per scene with
+its payoff frame, title, narration and a jump-to-time button over the video;
+← / → keys step through, Enter plays from a step), `guide.md` (the same as a
+README/SOP section: heading + frame + narration per scene), `scene-NN-<id>.png`
+frames, the SRT/VTT captions, and `walkthrough.json`. Frames come from the
+**final** video, so they carry zoom, cursor, overlays and the frame. Scene
+`title`s name the steps (falling back to ids).
+
+**Poster** (`output.poster: true`): also writes `output/poster.png`
+(`poster.<lang>.png` for language variants) — the first content frame after
+the intro card, for READMEs, social cards and `<video poster>`. The path is
+in `report.json` as `poster`.
+
 ## Motion blur & cursor
 
 Two more compose-time polish keys, both opt-in and portable (baseline `tmix` /
@@ -253,22 +592,57 @@ baked at record time as before (the default).
 
 ## Action vocabulary
 
-A `target` is `{selector}` or `{frame,selector}` or `{named:"composer"}`:
-- `{op:"goto", url}`
+A `target` is `{selector}` or `{frame,selector}` or `{named:"composer"}`.
+Every action also accepts `comment?`, `optional?` (best-effort, see below),
+`retry?` (0–5 extra attempts, interactions and `assert` only, a beat apart —
+for UI that re-renders under the cursor) and `anchor?` (land this action on a
+`{{@name}}` word in the narration — see *Narration-anchored beats*):
+- `{op:"goto", url}` — waits for `domcontentloaded`, then (capped at ~3.4 s)
+  for the network to go quiet and fonts to load; that extra wait is recorded
+  as trimmable idle (`"load"`), so a first click never lands on a skeleton
+  screen and the take doesn't get longer for it.
 - `{op:"type", target, text, humanize?}` — human-cadence typing
 - `{op:"press", key}` — e.g. "Enter"
-- `{op:"click", target}` · `{op:"hover", target}`
-- `{op:"scrollTo", target, easing?, durationMs?}` · `{op:"scrollBy", dy,
-  easing?, durationMs?}` — easing presets: `"smooth"` (default) | `"snappy"` |
-  `"glide"` | `"linear"`
+- `{op:"click", target, followPopup?}` · `{op:"hover", target}` —
+  `followPopup:true` handles a link/button that opens a **new tab**
+  (`target=_blank`, `window.open`): the tab is closed and the recorded tab
+  navigates to its URL. The take is one window — a second tab is never in the
+  video, so there is no `newTab`/`switchTab`; write the story in one tab.
+- `{op:"back"}` — browser history back, same readiness wait as `goto`.
+- `{op:"select", target, value? | label?}` — native `<select>`: the cursor
+  clicks it, the option is committed programmatically (the OS dropdown never
+  paints into a recording), `change` fires.
+- `{op:"drag", target, to:{target} | to:{x,y}}` — press on `target`, glide
+  with the cursor, release on the destination (pointer-event and HTML5 DnD
+  libraries both see a real drag; the cursor path is recorded).
+- `{op:"upload", target, files:[…]}` — attach files: `target` is the file
+  input (set directly) or the button that opens the file chooser (clicked; the
+  chooser is answered headlessly, no OS dialog in the take). Paths resolve
+  against the demo dir (`input/sample.csv`); a missing file fails the take.
+- `{op:"scrollTo", target, easing?, durationMs?, state?, settleMs?}` ·
+  `{op:"scrollBy", dy, target?, easing?, durationMs?, settleMs?}` — easing
+  presets: `"smooth"` (default) | `"snappy"` | `"glide"` | `"linear"`.
+  `scrollBy` with a `target` is **scoped to that element's own scroller**: the
+  wheel is dispatched over it and `dy` is clamped to the room its nearest
+  scrollable ancestor has left, so a bottomed-out inner panel never chains the
+  wheel to the page and slides the whole app off-screen (the log shows the
+  clamp). `settleMs` waits until the scroll position has been still for that
+  long (≤3 s) instead of a fixed pause — use it on smooth-scrolling pages
+  before a click. `scrollTo … state:"attached"` accepts a zero-size mount
+  point (see `waitFor`).
 - `{op:"focus", target, scale?, holdMs?}` — deliberate zoom beat on an element
   without clicking it (needs top-level `zoom` enabled)
 - `{op:"still", name}` — **screenshot mode**: mark a named still at this beat.
   A pure timeline marker (no screenshot at record time); `aidemo stills` /
   `render` extract `output/stills/<name>.png` from the clean take. See *Stills /
   screenshot mode* below.
-- `{op:"waitFor", target, timeoutMs?}` — normal wait (fires instantly if the
-  selector already matches — no good for in-place changes)
+- `{op:"waitFor", target, timeoutMs?, state?}` — normal wait (fires instantly
+  if the selector already matches — no good for in-place changes). Default
+  waits for **visible**; `state:"attached"` only requires the element to be in
+  the DOM — for a lazily-filled empty `<div>` (0 px tall until something
+  mounts into it on scroll), which is never "visible" and would time out. A
+  timeout names the total budget waited (`not visible after 30000ms (budget
+  30000ms)`), not Playwright's last poll chunk.
 - `{op:"waitForWidget", target, textMatches?, label?, timeoutMs?}` — **records
   the wait as idle** so compose trims/speeds it. Use for every ChatGPT
   "thinking" wait for a brand-**new** widget. When a prompt could render
@@ -294,6 +668,19 @@ A `target` is `{selector}` or `{frame,selector}` or `{named:"composer"}`:
   `"2"` for a 1→2 re-render. `idle:true` records it as trimmable idle like
   `waitForWidget`.
 - `{op:"pause", ms}` — a deliberate on-screen beat (not trimmed)
+- `{op:"moveTo", target}` · `{op:"moveTo", x, y}` — glide the cursor to an
+  element's center or an absolute viewport point **without clicking**: park it
+  out of the way before a reveal, or point at what the narration names.
+- `{op:"assert", target?, textMatches?, url?, timeoutMs?=5000}` — **prove the
+  payoff happened**: polls until `target` is visible (and its text matches
+  `textMatches`, JS regex, no inline flags — use `[Cc]onfirmed`) and/or the
+  page URL matches `url`; otherwise **fails the take with a named error**
+  (`assert failed after 5000ms: text "…" does not match /…/`). Put one after
+  the moment the demo exists to show (order confirmed, item added) so a
+  spinner never ships as a video. `optional:true` turns a miss into a logged
+  skip. Pair it with `select`/`drag`/`upload`: assert the visible result
+  (`"3 files attached"`, the dropped card) — the actions themselves only prove
+  the input was delivered.
 
 Target `last`/`nth` pick among matching **frames** on framed targets and among
 matching **elements** on plain (frameless) targets — e.g.
@@ -415,6 +802,24 @@ Confirmed by recording a real production shopping app (2026-07-06). The engine
 already handles the frame/timing/stealth cases below; you mostly need to author
 correctly.
 
+**Profile state is the silent failure.** The recording profile persists cookies
+and localStorage between takes — including anything a `probe` just did. A demo
+whose story starts at a first-run gate, an onboarding step, an empty state or a
+one-shot flow will *skip that beat* on the next take and record the opposite of
+what the narration says, with nothing failing and nothing to see in review.
+- Record such demos with **`--fresh`** (`record`/`probe`/`render`): the take
+  runs against a wiped throwaway profile in the demo dir, so every run starts
+  from a clean browser identity. Not for logged-in demos — a fresh profile has
+  no login.
+- Otherwise `record` warns when the profile already holds state for the
+  storyboard's first `goto` origin. When that state is deliberate (a login, a
+  cookie gate you seeded), acknowledge it with `--profile-seeded` /
+  `setup.expectState: true` — seeding via `setup.storageState`/`cookies`
+  implies it — so the log stays readable.
+- **`aidemo profile path`** prints the shared profile's location (handy when
+  the engine came from Homebrew or an npx cache); **`aidemo profile reset`**
+  wipes it.
+
 **Login & profile (the crux).**
 - Use a dedicated Chrome profile logged into ChatGPT with the app's dev
   connector enabled (`AIDEMO_CHROME_PROFILE` or the `profile` option). Run
@@ -526,8 +931,33 @@ Always set `"last": true` on widget targets (newest widget for this turn).
   `logs/fail-<scene>-<n>.{png,json}` (screenshot + which frames matched).
 - **A failed take is salvaged, not lost**: `record` writes a partial
   `timeline.json` and keeps the main recording even when a late scene fails, so
-  a scene-7-of-7 failure doesn't discard the good footage. Re-run to get a
-  clean take.
+  a scene-7-of-7 failure doesn't discard the good footage. Then **resume
+  instead of re-recording**: `record {fromScene: "s7"}` (CLI `record <dir>
+  --from-scene s7`, also on `render`) keeps the earlier scenes' footage and
+  timeline, replays their actions at speed only to rebuild the app state, and
+  records from `s7` on. Reuse is guarded by a per-scene hash of the actions
+  (+ hide/redact/viewport/cursor mode/`setup`/`params`): an edited earlier
+  scene refuses with "resume from `<id>` or earlier". A resume must also keep
+  the same capture mode and viewport as the take it continues — compose refuses
+  a timeline whose raw files differ in size rather than misplacing every
+  overlay on the reused scenes.
+- **Flows you cannot replay**: when the demo *earns* one-shot state (a balance
+  goes 10 → 20, an invite is consumed, a coupon burns), `--from-scene` is not a
+  speed optimisation — it is the only correct retry. A full re-record replays
+  actions against an app that has already moved on, so it either fails or
+  records the wrong numbers; resuming keeps the earned footage and picks up at
+  the scene that broke. Pair it with `setup.expectState: true` so the
+  carried-over-state warning stays quiet on the seeded profile.
+  **But a plain resume still *replays* the earlier scenes' actions** to rebuild
+  state — on a state-earning flow that replay itself fails (the first scene
+  waits for a "stranger" element the profile no longer shows). Add
+  `--no-replay` (`record`/`render`, `{noReplay: true}`) to skip the replayed
+  scenes' actions entirely and trust the profile as it stands; the scene you
+  resume from must then open with its own `goto`. This is also how you record
+  one storyboard across two real days (day 0 today, day 1 after the app's
+  date rolls over) on one profile.
+  The same flag is the cheap way to re-shoot
+  a tail you changed after an approved take.
 
 `init_demo` / `aidemo init` scaffolds a storyboard already using all of the
 above.
@@ -609,8 +1039,31 @@ renders relative to its own dir, keep any local asset paths (e.g. a music
 
 ## Verify before declaring done
 
-Play (or frame-extract) `output/final-demo.mp4`: cursor glides and clicks
-pulse, narration matches on-screen actions, captions are readable and in sync,
+**A selector that matched nothing** fails the take with drift suggestions:
+the failure log (and `logs/fail-<scene>-<n>.json`, `driftCandidates`) lists
+the interactive elements that most resemble what the selector asked for —
+by testid / id / text similarity — each with a unique selector to paste, and
+`logs/drift-<scene>-<n>.json` holds the full ranked list. If nothing similar
+is on the page, you are on the wrong screen or state (a gate, a stale
+profile, a navigation that didn't land): check the screenshot first.
+
+Start with **`output/report.json`** (written by every compose; the `render` /
+`compose` job results carry `report` and `warnings`): per scene it records
+the recorded length, the narration target, the retime `factor` applied, and
+`holdMs`/`holdPct` (how much of the scene is a held frame), plus the tail and
+blank-frame trims, `autoIdleMs` (motionless footage `autoIdle` capped, 0 when
+off), focus events kept vs dropped, and `warnings[]` —
+`scene-freeze` (a scene is >40% held frame), `overrun-trim` (actions ran past
+the narration even at the x1.6 ceiling and were cut), `blank-tail`,
+`stale-captions`, `focus-dropped`, `cursor-missing`, `anchor-unreachable`
+(an anchored action could not reach its word within the retime limits; the
+scene's `anchors[]` shows `targetMs` / `landedMs` / `offMs`). A held scene
+is a storyboard problem, not a compose problem: give it on-screen beats or
+shorten its narration, then re-run `voice` + `compose`.
+
+Then play (or frame-extract — `aidemo frames <dir>` / the `frames` job)
+`output/final-demo.mp4`: cursor glides and clicks pulse, narration matches
+on-screen actions, captions are readable and in sync,
 no dead air, and the key moment (e.g. checkout confirmed) is actually visible
 on screen. If the demo is headed for a README, run the `gif` job — GIFs
 autoplay on GitHub; MP4s don't.
@@ -622,14 +1075,71 @@ CLI. If nothing came up, skip this.
 
 ## Debugging
 
+- **`generated/timeline.json` → `scenes[].actions[]`** is the per-action
+  record of the take: `{index, op, target, startMs, endMs, ok, skipped?,
+  retries?, warnings?[]}`. Read it to see which action ate the time, which
+  optional action was skipped and why, and which action window saw failed
+  requests (`"2 failed request(s): 500 POST /api/cart …"`) — the record-side
+  twin of `output/report.json`.
 - Every run tees its output to `<demo>/logs/<command>.log`; a failed take also
   leaves `logs/fail-<scene>-<n>.{png,json}`. `job_status` surfaces all of these
   paths on failure.
+- The fail JSON (and the error text) carries **`failedRequests`**: every
+  HTTP ≥400 response and network failure since the previous action, with
+  method, URL, status and the first bytes of an xhr/fetch error body. A click
+  that "did nothing" because the backend answered 500 looks like a click miss
+  in the screenshot; this is where the reason shows up.
+- **`output/report.json`** (every compose) says *why* a scene looks slow or
+  cut: per-scene retime factor, hold %, trims, and the `warnings[]` list; the
+  compose log prints the same warnings. `aidemo lint <dir>` predicts them
+  without a browser.
+- **`aidemo frames <dir> --every 3`** (MCP `frames`) dumps evenly spaced PNGs
+  from `output/final-demo.mp4` into `output/frames/` — look at them instead of
+  hand-running `ffmpeg -ss`. `--source raw` samples the latest raw file;
+  `--source take` samples the whole recorded take by walking `timeline.json`,
+  so a resumed take's earlier scenes are included and each frame is named with
+  the scene it came from.
+- **Resumed takes** (`--from-scene`): `timeline.json` scenes reused from an
+  earlier take carry `source` (their raw file, `recordings/raw.keep-*`) and
+  `leadInMs`; `recordings/raw.*` holds only the new tail. `frames --source
+  raw` therefore shows the new part only — use `--source take` (or review the
+  composed video) to see the whole thing.
 - `AIDEMO_KEEP_TMP=1` preserves `.compose-tmp/` intermediates when debugging
   compose.
 - `doctor` checks Node, ffmpeg, Chrome, the TTS/STT endpoint (and flags
   LLM-only servers like Ollama, which have no audio endpoints — point
   `OPENAI_BASE_URL` at a speech server such as speaches instead).
+
+## Import from Playwright (trace or test file)
+
+When the product already has an e2e test for the flow, don't re-derive the
+selectors: `import_trace {file, name}` / `aidemo import-trace <file> --name
+<name>` takes a **`trace.zip`** (`npx playwright test --trace on`, or
+`context.tracing.start/stop`) or a **`*.spec.ts`** file and writes
+`demos/<name>/` with a draft storyboard:
+
+- the run's own actions become beats — `goto`, `fill`→`type`, `click`,
+  `hover`, `press`, `selectOption`→`select`, `setInputFiles`→`upload`,
+  `waitForSelector`→`waitForWidget`, `dragAndDrop`→`drag`, `expect(...)
+  .toBeVisible/toHaveText/toHaveURL/toBeChecked/toHaveAttribute`→`assert`
+  (the last two fold the condition into the selector as `>> :scope:checked` /
+  `>> :scope[href="…"]`); `toHaveScreenshot` is dropped with a note — it
+  asserts pixels, not a story beat; calls that failed in the trace are dropped;
+- `getByRole/getByTestId/getByText/getByPlaceholder` and `internal:` engines
+  become plain storyboard selectors (`role=button[name="Add to basket"i]`,
+  `[data-testid="x"]`, `text=…`); `getByLabel` stays an `internal:label="…"i`
+  selector, which `page.locator` resolves to the labelled control;
+  `frameLocator` chains become a `frames` entry + `target.frame`;
+  `.first()/.nth()/.last()` become `nth`/`last`; in a test file a locator
+  parked in a `const` is followed to its use;
+- scenes are cut at each `goto` and before a click whose payoff is an explicit
+  wait or assertion; narration is `<narrate: …>` placeholders; `_notes` lists
+  every approximation (a statement the line-based test parser could not read —
+  a page-object helper, say — or an upload whose file you must copy into
+  `input/`).
+
+Then write the narration, merge or split scenes to one beat each, and
+`probe`. Nothing is inferred by a model — the storyboard is the test, retold.
 
 ## Demo as regression test
 
@@ -651,8 +1161,13 @@ prints a readable field-level diff (`$.scenes[2].actions[0].found: expected
 true, got false`) and exits non-zero. A missing baseline is a clear error
 telling you to run `--update-golden` first. In golden mode a failing action is
 recorded (`ok:false`) and the run continues, so you get the full diff instead of
-an abort at the first break. (The MCP `probe` tool takes the same `updateGolden`
-/ `golden` params and returns `golden.match` + `golden.diffs` in its result.)
+an abort at the first break — and each broken selector gets the same
+diagnostics as a hard failure: `logs/fail-<scene>-<n>.png` plus
+`logs/drift-<scene>-<n>.json` with the nearest interactive elements and their
+unique selectors, listed under the diff as `selector drift → …`. Read the drift
+file, swap the selector, re-probe. (The MCP `probe` tool takes the same
+`updateGolden` / `golden` params and returns `golden.match`, `golden.diffs` and
+`golden.drift[]` — `{scene, action, file}` — in its result.)
 
 Wire it into CI so a breaking UI change is a failed check:
 
@@ -673,8 +1188,8 @@ Estonian "uus kuub" came back "Scoop", "AI-treener" came back "EI treener").
 To keep the transcript honest, the request is biased with what the engine
 already knows about the script:
 
-- **Prompt bias (always on).** The storyboard's narration text (in scene
-  order) is sent as Whisper's `prompt`, nudging the transcript to converge on
+- **Prompt bias (always on).** Any top-level `knownTerms` glossary, then the
+  storyboard's narration text (in scene order), is sent as Whisper's `prompt`, nudging the transcript to converge on
   the actual scripted words/spelling instead of guessing from audio phonetics
   alone — while still keeping real word-level timing from the audio. This
   changes STT output for every non-trivial demo (strictly for the better:
@@ -689,7 +1204,8 @@ already knows about the script:
   monolingual non-English demo) without editing the storyboard.
 
 **Non-English narration:** prompt bias + a language hint fix the common case,
-but Whisper can still misspell unusual or compound words. If burned-in
+but Whisper can still misspell unusual or compound words. Add the offenders to
+top-level `knownTerms` first — that keeps real word timings. If burned-in
 captions still look wrong, **`aidemo captions <dir> --offline` is the
 guaranteed-correct fallback** — cues are derived directly from the storyboard
 script (correct spelling by construction, since there's no transcription at
