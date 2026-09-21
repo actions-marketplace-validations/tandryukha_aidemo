@@ -1,5 +1,6 @@
-import type { Page, Locator, Frame, Request, Response } from "playwright";
+import type { Page, Locator, Frame, Request, Response, Dialog } from "playwright";
 import { scanInteractive, rankCandidates, type DriftCandidate } from "./inspect.js";
+import { compileUserRegex } from "./safe-regex.js";
 import { promises as fs } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { existsSync } from "node:fs";
@@ -129,8 +130,23 @@ interface SceneCapture {
   keyEvents: KeyEvent[];
   redactSpans: RedactSpan[];
   anchorEvents: Array<{ name: string; tMs: number; action: number }>;
+  /** Armed one-shot native-dialog handlers awaiting their dialog (`dialog` op). */
+  pendingDialogs: PendingDialog[];
+  /** Warnings raised inside an action, drained into its timeline record. */
+  pendingWarnings: string[];
   /** Replay-only scene (resume): skip the waits that exist for the camera. */
   fast?: boolean;
+}
+
+/** A `dialog` action's armed handler, resolved when its dialog actually fires. */
+interface PendingDialog {
+  /** 0-based index of the `dialog` action that armed it. */
+  index: number;
+  label: string;
+  required: boolean;
+  timeoutMs: number;
+  seen: Promise<string | null>;
+  disarm: () => void;
 }
 
 /** Record-time dwell for an attention beat (the hold itself is compose-time). */
@@ -330,6 +346,8 @@ export async function runStoryboard(
       keyEvents: [],
       redactSpans: [],
       anchorEvents: [],
+      pendingDialogs: [],
+      pendingWarnings: [],
       fast: opts.replayUntil != null && si < opts.replayUntil,
     };
     // Per-scene `hide` (top-level hides are injected by the recorder's init
@@ -460,6 +478,12 @@ export async function runStoryboard(
           });
         }
       }
+      if (action.op !== "dialog") {
+        recWarnings.push(...(await settlePendingDialogs(capture)));
+      }
+      if (capture.pendingWarnings.length) {
+        recWarnings.push(...capture.pendingWarnings.splice(0));
+      }
       rec.endMs = now();
       const failedInWindow = net.since(rec.startMs);
       if (failedInWindow.length) {
@@ -493,6 +517,8 @@ export async function runStoryboard(
         probeOutcomes.push(outcome);
       }
     }
+    // A `dialog` armed by the scene's LAST action still has to be accounted for.
+    await settlePendingDialogs(capture);
     if (opts.probe) opts.probe.push({ id: scene.id, actions: probeOutcomes });
     // Close every open redact span at the scene boundary and drop the scene hide.
     for (const span of redactOpen.values()) {
@@ -714,7 +740,18 @@ async function countNestedMatches(page: Page, selector: string): Promise<number>
 async function resolveTargetLocator(
   page: Page,
   storyboard: Storyboard,
-  target: Target
+  target: Target,
+  opts: {
+    /**
+     * Pick the first VISIBLE match instead of the first match in DOM order
+     * (issue #55): a page whose first `table` is a hidden template would
+     * otherwise time out waiting for an element that is never shown. Only
+     * honoured when the target does not pin a match with `last`/`nth`.
+     */
+    preferVisible?: boolean;
+    /** Return the whole matching SET (no first/last/nth) — for counting. */
+    all?: boolean;
+  } = {}
 ): Promise<Locator> {
   let selector = target.selector;
   if (target.named) {
@@ -731,7 +768,10 @@ async function resolveTargetLocator(
     // Frameless targets honor last/nth at the ELEMENT level (e.g. the newest
     // assistant message); previously they silently collapsed to .first().
     const loc = page.locator(selector);
-    return target.last ? loc.last() : target.nth != null ? loc.nth(target.nth) : loc.first();
+    if (opts.all) return loc;
+    if (target.last) return loc.last();
+    if (target.nth != null) return loc.nth(target.nth);
+    return opts.preferVisible ? loc.locator("visible=true").first() : loc.first();
   }
   const frameSelector = storyboard.frames[target.frame];
   if (!frameSelector) {
@@ -753,7 +793,11 @@ async function resolveTargetLocator(
     : target.nth != null
       ? frame.nth(target.nth)
       : frame.first();
-  return frame.locator(selector).first();
+  const inFrame = frame.locator(selector);
+  if (opts.all) return inFrame;
+  return opts.preferVisible && !target.last && target.nth == null
+    ? inFrame.locator("visible=true").first()
+    : inFrame.first();
 }
 
 /** Human-readable target for error messages: `frame >> selector [last]`. */
@@ -779,9 +823,15 @@ async function waitForTargetVisible(
   const started = Date.now();
   const deadline = started + timeoutMs;
   let lastErr: unknown;
+  // Half the budget on the exact first match (the old behavior, so a selector
+  // that resolves keeps resolving identically), then on the first VISIBLE match
+  // — the fix for a hidden template/print copy sitting ahead of the real one in
+  // DOM order (issue #55).
+  const flipAt = started + Math.min(timeoutMs / 2, 4000);
   for (;;) {
+    const preferVisible = state === "visible" && Date.now() >= flipAt;
     try {
-      const loc = await resolveTargetLocator(page, storyboard, target);
+      const loc = await resolveTargetLocator(page, storyboard, target, { preferVisible });
       const remaining = deadline - Date.now();
       await loc.waitFor({
         state,
@@ -797,9 +847,14 @@ async function waitForTargetVisible(
       const hint = /Timeout \d+ms exceeded/.test(reason)
         ? "" // Playwright's chunk timeout — nothing more to say than the budget
         : ` (last error: ${reason})`;
+      const counts = await countMatches(page, storyboard, target).catch(() => null);
+      const census =
+        counts && counts.total > 0
+          ? ` — ${counts.total} match(es) in the DOM, ${counts.visible} visible`
+          : "";
       throw new Error(
         `waitFor: "${describeTarget(storyboard, target)}" not ${state} after ` +
-          `${waited}ms (budget ${timeoutMs}ms)${hint}` +
+          `${waited}ms (budget ${timeoutMs}ms)${hint}${census}` +
           (state === "visible"
             ? ` — if the element is a zero-size mount point that fills later, use state: "attached"`
             : "")
@@ -807,6 +862,18 @@ async function waitForTargetVisible(
     }
     await sleep(300);
   }
+}
+
+/** How many elements the target matches, and how many of those are visible. */
+async function countMatches(
+  page: Page,
+  storyboard: Storyboard,
+  target: Target
+): Promise<{ total: number; visible: number }> {
+  const base = await resolveTargetLocator(page, storyboard, target, { all: true });
+  const total = await base.count().catch(() => 0);
+  const visible = await base.locator("visible=true").count().catch(() => 0);
+  return { total, visible };
 }
 
 /**
@@ -871,7 +938,7 @@ async function waitForNewWidget(
     await waitForTargetVisible(page, storyboard, target, opts.timeoutMs);
     return;
   }
-  const re = opts.textMatches ? new RegExp(opts.textMatches, "i") : null;
+  const re = opts.textMatches ? compileUserRegex(opts.textMatches, "i", "textMatches") : null;
   const deadline = Date.now() + opts.timeoutMs;
   const baseline = await countNestedMatches(page, selector);
   for (;;) {
@@ -936,7 +1003,7 @@ async function waitForNewReply(
 ): Promise<void> {
   const messages = page.locator(opts.selector);
   const stop = page.locator(STOP_BUTTON_SELECTOR);
-  const re = opts.textMatches ? new RegExp(opts.textMatches, "i") : null;
+  const re = opts.textMatches ? compileUserRegex(opts.textMatches, "i", "textMatches") : null;
   const baseline = await messages.count().catch(() => 0);
   let sawStreaming = (await stop.count().catch(() => 0)) > 0;
   const deadline = Date.now() + opts.timeoutMs;
@@ -1018,6 +1085,34 @@ async function optionalTargetAbsent(
  * with a beat between attempts. Returns the number of extra attempts used.
  * The last failure propagates so the normal fail/optional paths apply.
  */
+/**
+ * Verify every armed `dialog` handler got its dialog (issue #54). Called after
+ * the action that was expected to trigger it, and again at scene end. Returns
+ * the warnings to attach; throws when a REQUIRED dialog never appeared, because
+ * the filmed action then silently did nothing.
+ */
+async function settlePendingDialogs(capture: SceneCapture): Promise<string[]> {
+  if (!capture.pendingDialogs.length) return [];
+  const pending = capture.pendingDialogs.splice(0);
+  const warnings: string[] = [];
+  for (const p of pending) {
+    const message = await Promise.race([
+      p.seen,
+      sleep(p.timeoutMs).then(() => undefined),
+    ]);
+    if (typeof message === "string") continue;
+    p.disarm();
+    const why =
+      `${p.label}: no native dialog appeared within ${p.timeoutMs}ms — the ` +
+      `action after it did not open one (wrong action order, or the control ` +
+      `no longer confirms)`;
+    if (p.required) throw new Error(why);
+    warnings.push(why);
+    log(`  ⚠ ${why}`);
+  }
+  return warnings;
+}
+
 async function runActionWithRetry(
   page: Page,
   storyboard: Storyboard,
@@ -1111,8 +1206,8 @@ async function runAction(
       }
       const timeoutMs = action.timeoutMs ?? 5000;
       const deadline = Date.now() + timeoutMs;
-      const textRe = action.textMatches ? new RegExp(action.textMatches) : null;
-      const urlRe = action.url ? new RegExp(action.url) : null;
+      const textRe = action.textMatches ? compileUserRegex(action.textMatches, "", "assert.textMatches") : null;
+      const urlRe = action.url ? compileUserRegex(action.url, "", "assert.url") : null;
       let why = "";
       if (action.target) {
         // Visible first (honest total-budget error if it never shows up).
@@ -1178,6 +1273,46 @@ async function runAction(
       await page.goBack({ waitUntil: "domcontentloaded" });
       await awaitGotoReadiness(page, capture, t0);
       return;
+
+    // Arm a one-shot answer for the NEXT native dialog (issue #54). Playwright
+    // auto-dismisses dialogs when nothing listens, so a filmed click on a
+    // confirm-guarded control would otherwise put a false outcome on camera.
+    // The handler is verified after the action that follows: an armed dialog
+    // that never fired is a failure unless `required: false`.
+    case "dialog": {
+      const mode = action.action ?? "accept";
+      const label = `dialog ${mode}`;
+      let settle: (message: string | null) => void = () => {};
+      const seen = new Promise<string | null>((r) => {
+        settle = r;
+      });
+      const handler = (dialog: Dialog) => {
+        void (async () => {
+          log(`  ${dialog.type()}: "${dialog.message()}" → ${mode}`);
+          if (action.holdMs) await sleep(action.holdMs);
+          try {
+            if (mode === "accept") await dialog.accept(action.promptText);
+            else await dialog.dismiss();
+          } catch (err) {
+            log(`  ! answering the dialog failed — ${firstLine(err)}`);
+          }
+          settle(dialog.message());
+        })();
+      };
+      page.once("dialog", handler);
+      capture.pendingDialogs.push({
+        index: capture.actions.length,
+        label,
+        required: action.required !== false,
+        timeoutMs: action.timeoutMs ?? 5000,
+        seen,
+        disarm: () => {
+          page.off("dialog", handler);
+          settle(null);
+        },
+      });
+      return;
+    }
 
     case "select": {
       if (action.value == null && action.label == null) {
@@ -1295,8 +1430,18 @@ async function runAction(
     case "highlight":
     case "spotlight":
     case "callout": {
-      const loc = await resolveTargetLocator(page, storyboard, action.target);
-      const rect = await rectOf(page, loc);
+      const loc = await resolveTargetLocator(page, storyboard, action.target, {
+        preferVisible: true,
+      });
+      // #56: the overlay is drawn at compose time from THIS rect, so it has to
+      // be the rect the element actually occupies while the overlay is on
+      // screen. Lazy content loading in above the target shifts it after the
+      // measure with the scroll offset unchanged — invisible to the scroll
+      // settle — and the outline then lands on whatever moved into its place.
+      const rect = await settledRectOf(page, loc, capture.fast ? 0 : 400);
+      if (storyboard.attention?.cursorClear && !capture.fast) {
+        await clearCursorOf(page, mouse, rect, sample);
+      }
       const holdMs =
         action.holdMs ??
         (action.op === "callout" ? CALLOUT_HOLD_DEFAULT_MS : ATTENTION_HOLD_DEFAULT_MS);
@@ -1320,13 +1465,65 @@ async function runAction(
       }
       capture.attentionEvents.push(ev);
       if (!capture.fast) await sleep(Math.min(holdMs, ATTENTION_DWELL_MAX_MS));
+      // Re-measure once the dwell is over: if it moved, the overlay we just
+      // logged would be drawn over the wrong pixels. Prefer the later rect
+      // (that is where the element sits for most of the hold) and say so.
+      const after = await rectOf(page, loc).catch(() => null);
+      if (after) {
+        const moved = Math.max(Math.abs(after.x - rect.x), Math.abs(after.y - rect.y));
+        if (moved > ATTENTION_DRIFT_TOLERANCE_PX) {
+          ev.x = after.x;
+          ev.y = after.y;
+          ev.w = after.w;
+          ev.h = after.h;
+          const warning =
+            `${action.op} target moved ${moved}px after the measure (layout ` +
+            `settled late — lazy content above it?); used the later rect`;
+          capture.pendingWarnings.push(warning);
+          log(`  ⚠ ${warning}`);
+        }
+      }
+      const box = after ?? rect;
+      const vp = page.viewportSize();
+      if (vp && (box.y + box.h <= 0 || box.y >= vp.height || box.x + box.w <= 0 || box.x >= vp.width)) {
+        const warning =
+          `${action.op} target is OFF SCREEN at draw time ` +
+          `(${box.x},${box.y} ${box.w}x${box.h} in a ${vp.width}x${vp.height} viewport) — ` +
+          `the overlay will be drawn outside the frame; scroll it into view first`;
+        capture.pendingWarnings.push(warning);
+        log(`  ⚠ ${warning}`);
+      }
       return;
     }
 
     case "hover": {
       const loc = await resolveTargetLocator(page, storyboard, action.target);
       const box = await boxOf(page, loc);
-      await moveMouseTo(page, mouse, box.cx, box.cy, sample);
+      let x = box.cx;
+      let y = box.cy;
+      // Park off the element when asked (issue #50): a pointer on the centre
+      // of a 30-px chip hides the very number the narration is about.
+      if (action.anchor && action.anchor !== "center") {
+        const rect = await rectOf(page, loc).catch(() => null);
+        if (rect) {
+          const pad = 10;
+          const side =
+            action.anchor === "edge"
+              ? rect.y > (page.viewportSize()?.height ?? 0) / 2
+                ? "top"
+                : "bottom"
+              : action.anchor;
+          if (side === "top") y = rect.y - pad;
+          else if (side === "bottom") y = rect.y + rect.h + pad;
+          else if (side === "left") x = rect.x - pad;
+          else if (side === "right") x = rect.x + rect.w + pad;
+        }
+      }
+      if (action.offset) {
+        x += action.offset.x;
+        y += action.offset.y;
+      }
+      await moveMouseTo(page, mouse, x, y, sample);
       await sleep(300);
       return;
     }
@@ -1672,7 +1869,7 @@ async function waitForChange(
   target: Target,
   opts: { textMatches?: string; timeoutMs: number }
 ): Promise<void> {
-  const re = opts.textMatches ? new RegExp(opts.textMatches, "i") : null;
+  const re = opts.textMatches ? compileUserRegex(opts.textMatches, "i", "textMatches") : null;
   const base = await signatureOf(page, storyboard, target);
   const deadline = Date.now() + opts.timeoutMs;
   for (;;) {
@@ -1907,7 +2104,26 @@ async function boxOf(page: Page, loc: Locator): Promise<{ cx: number; cy: number
   for (let i = 0; i < 3 && box && vp; i++) {
     const cy = box.y + box.height / 2;
     if (cy >= 80 && cy <= vp.height - 120) break;
-    await easedWheel(page, cy - vp.height * 0.55, { durationMs: 500 });
+    const dy = cy - vp.height * 0.55;
+    // A sticky/fixed element (a header chip) never moves with the scroller,
+    // and a page already at its top/bottom cannot scroll that way — wheeling
+    // anyway only rubber-bands the whole page (a 1 Hz ~6 px bob on the take,
+    // three bounces per hover/click on a header target; loyalty v7 take 1).
+    const canNudge = await loc
+      .evaluate((el, d) => {
+        let n: Element | null = el;
+        while (n && n !== document.body) {
+          const pos = getComputedStyle(n).position;
+          if (pos === "fixed" || pos === "sticky") return false;
+          n = n.parentElement;
+        }
+        const se = document.scrollingElement ?? document.documentElement;
+        const max = se.scrollHeight - se.clientHeight;
+        return d < 0 ? se.scrollTop > 0 : se.scrollTop < max - 1;
+      }, dy)
+      .catch(() => true);
+    if (!canNudge) break;
+    await easedWheel(page, dy, { durationMs: 500 });
     box = await loc.boundingBox();
   }
   if (!box) throw new Error("Element has no bounding box (not visible?)");
@@ -1928,6 +2144,78 @@ async function rectOf(
     w: Math.round(box.width),
     h: Math.round(box.height),
   };
+}
+
+/**
+ * Glide the pointer just outside `rect` so it does not sit on top of what the
+ * beat is showcasing (`attention.cursorClear`, issue #50). Picks the nearest
+ * side with room in the viewport; a no-op when the cursor is already clear.
+ */
+async function clearCursorOf(
+  page: Page,
+  mouse: MouseState,
+  rect: { x: number; y: number; w: number; h: number },
+  sample?: CursorSampler
+): Promise<void> {
+  const pad = 18;
+  const inside =
+    mouse.x >= rect.x - 2 &&
+    mouse.x <= rect.x + rect.w + 2 &&
+    mouse.y >= rect.y - 2 &&
+    mouse.y <= rect.y + rect.h + 2;
+  if (!inside) return;
+  const vp = page.viewportSize() ?? { width: 1280, height: 720 };
+  const below = rect.y + rect.h + pad;
+  const above = rect.y - pad;
+  const right = rect.x + rect.w + pad;
+  const left = rect.x - pad;
+  let x = mouse.x;
+  let y = mouse.y;
+  if (below < vp.height - 8) y = below;
+  else if (above > 8) y = above;
+  else if (right < vp.width - 8) x = right;
+  else if (left > 8) x = left;
+  else return;
+  await moveMouseTo(page, mouse, x, y, sample);
+  await sleep(120);
+}
+
+/** How far an attention target may shift after its measure before we re-aim. */
+const ATTENTION_DRIFT_TOLERANCE_PX = 24;
+
+/**
+ * `rectOf`, but only once the element's box has stopped moving for `quietMs`
+ * (bounded at 2 s). Unlike `waitScrollSettled` this watches the RECT, so a
+ * layout shift at an unchanged scroll offset — lazily-loaded content inserted
+ * above the target — is caught (issue #56).
+ */
+async function settledRectOf(
+  page: Page,
+  loc: Locator,
+  quietMs: number
+): Promise<{ x: number; y: number; w: number; h: number }> {
+  if (quietMs <= 0) return rectOf(page, loc);
+  const deadline = Date.now() + 2000;
+  let last = await rectOf(page, loc);
+  let stillSince = Date.now();
+  while (Date.now() < deadline) {
+    await sleep(80);
+    const cur = await rectOf(page, loc).catch(() => null);
+    if (!cur) continue;
+    if (
+      Math.abs(cur.x - last.x) > 1 ||
+      Math.abs(cur.y - last.y) > 1 ||
+      Math.abs(cur.w - last.w) > 1 ||
+      Math.abs(cur.h - last.h) > 1
+    ) {
+      last = cur;
+      stillSince = Date.now();
+      continue;
+    }
+    last = cur;
+    if (Date.now() - stillSince >= quietMs) break;
+  }
+  return last;
 }
 
 /** CSS used for `hide` selectors (record-time, the one non-compose exception). */

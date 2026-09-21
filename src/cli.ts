@@ -11,8 +11,9 @@ import {
 import { resetProfile } from "./profile.js";
 import { Project, parseStoryboard } from "./project.js";
 import { record } from "./recorder.js";
-import { parseCookieFlag } from "./setup.js";
+import { collectSeeds, parseCookieFlag, runPreflight } from "./setup.js";
 import { extractFrames } from "./frames.js";
+import { runQa, logQa } from "./qa.js";
 import { inspectPage } from "./inspect.js";
 import { importTrace, scaffoldImported } from "./import-trace.js";
 import { GUIDE_TOPIC_NAMES, guideHeadings, readGuide, sliceGuide } from "./guide.js";
@@ -332,6 +333,8 @@ const LANGS_OPT_DESC =
  * `[undefined]` when neither is given — the default single-language render,
  * byte-for-byte unchanged (undefined = the base storyboard, unsuffixed paths).
  */
+const STRICT_OPT_DESC =
+  "exit 1 when compose reports any warning (anchor-unreachable, overrun-trim, scene-freeze, blank-open …) — each one maps to a defect a viewer will see";
 const STORAGE_STATE_OPT_DESC =
   "seed a Playwright storageState JSON (cookies + localStorage) into the profile before the take";
 const COOKIE_OPT_DESC =
@@ -576,6 +579,12 @@ program
   .option("--limit <n>", "max elements (default 80)", "80")
   .option("--viewport <WxH>", "viewport (default 1280x720)")
   .option("--frame <name=selector>", "also scan this iframe (repeatable)", collectKv, [])
+  .option("--storage-state <file>", STORAGE_STATE_OPT_DESC)
+  .option("--cookie <spec>", COOKIE_OPT_DESC, collectKv, [])
+  .option(
+    "--no-setup",
+    "with --dir: ignore the storyboard's setup block (cookies/storageState/preflight)"
+  )
   .option("--json", "print the full JSON result", false)
   .description(
     "list the page's visible interactive elements with unique selectors (no selector guessing)"
@@ -590,6 +599,9 @@ program
         limit: string;
         viewport?: string;
         frame: string[];
+        storageState?: string;
+        cookie: string[];
+        setup?: boolean;
         json?: boolean;
       }
     ) => {
@@ -602,12 +614,44 @@ program
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const project = opts.dir ? new Project(opts.dir) : null;
       if (project) await ensureDir(project.p("logs"));
+      // #53: authenticate the scan the same way a take does — the storyboard
+      // already declares how (setup.storageState / cookies / preflight), and
+      // --storage-state / --cookie layer on top for a project-less inspect.
+      const useSetup = opts.setup !== false;
+      let storyboard: Awaited<ReturnType<Project["loadStoryboard"]>> | null = null;
+      if (project && useSetup) {
+        storyboard = await project.loadStoryboard({ relaxed: true }).catch(() => null);
+      }
+      if (storyboard?.setup?.preflight) {
+        await runPreflight(storyboard.setup.preflight, {
+          demoDir: project!.dir,
+          storyboardPath: project!.storyboardPath,
+          profileDir: opts.profile ?? chromeProfileDir(),
+        });
+        storyboard = await project!.loadStoryboard({ relaxed: true }).catch(() => storyboard);
+      }
+      const seeds = await collectSeeds(
+        project?.dir ?? process.cwd(),
+        storyboard ?? ({ setup: undefined } as never),
+        {
+          storageState: opts.storageState,
+          cookies: opts.cookie?.length ? opts.cookie.map(parseCookieFlag) : undefined,
+        }
+      );
+      for (const [name, selector] of Object.entries(storyboard?.frames ?? {})) {
+        if (!(name in frames)) frames[name] = selector;
+      }
       const res = await inspectPage({
         url,
         headless: !opts.headed,
         profileDir: opts.profile,
         limit: Number(opts.limit) || 80,
-        ...(vp ? { viewport: { width: Number(vp[1]), height: Number(vp[2]) } } : {}),
+        ...(vp
+          ? { viewport: { width: Number(vp[1]), height: Number(vp[2]) } }
+          : storyboard?.video
+            ? { viewport: storyboard.video }
+            : {}),
+        seeds,
         frames,
         ...(project ? { screenshotPath: project.p("logs", `inspect-${stamp}.png`) } : {}),
       });
@@ -652,13 +696,22 @@ program
   )
   .option("--width <px>", "frame width in px, aspect kept (default 640)", "640")
   .option("--out <dir>", "output directory (default <dir>/output/frames)")
+  .option("--sheet", "also tile the frames into one contact-sheet PNG", false)
+  .option("--columns <n>", "contact-sheet columns (default 5)", "5")
   .description(
     "dump evenly spaced PNG frames from the final video (or the raw take) for review"
   )
   .action(
     async (
       dir: string,
-      opts: { every: string; source: string; width: string; out?: string }
+      opts: {
+        every: string;
+        source: string;
+        width: string;
+        out?: string;
+        sheet?: boolean;
+        columns: string;
+      }
     ) => {
       const everySec = Number(opts.every);
       if (!(everySec > 0)) throw new Error(`--every must be a positive number of seconds`);
@@ -671,6 +724,8 @@ program
         source: opts.source as "final" | "raw" | "take",
         width: parsePositiveInt("--width", opts.width),
         outDir: opts.out ? resolve(opts.out) : undefined,
+        sheet: opts.sheet,
+        sheetColumns: parsePositiveInt("--columns", opts.columns),
       });
       step("Frames");
       ok(
@@ -678,6 +733,7 @@ program
           `(${(res.durationMs / 1000).toFixed(1)}s)`
       );
       for (const f of res.files) log(`  ${f}`);
+      if (res.sheet) ok(`contact sheet → ${res.sheet}`);
     }
   );
 
@@ -955,26 +1011,66 @@ program
   .option("--param <kv>", PARAM_OPT_DESC, collectKv, [])
   .option("--lang <code>", LANG_OPT_DESC)
   .option("--langs <codes>", LANGS_OPT_DESC)
+  .option("--strict", STRICT_OPT_DESC, false)
   .description("trim, sync, mux and caption into output/final-demo.mp4")
   .action(
     async (
       dir: string,
-      opts: { gif?: boolean; param?: string[]; lang?: string; langs?: string }
+      opts: { gif?: boolean; param?: string[]; lang?: string; langs?: string; strict?: boolean }
     ) => {
       const storyboard = await new Project(dir).loadStoryboard({
         params: parseParams(opts.param),
       });
+      let warningTotal = 0;
       for (const lang of langsFrom(opts)) {
         const project = new Project(dir, lang);
         await beginCommand(project, "compose");
         const sb = lang ? localizeStoryboard(storyboard, lang) : storyboard;
-        await compose(project, sb);
+        const report = await compose(project, sb);
+        warningTotal += report.warnings.length;
         if (opts.gif) await exportGif(project);
         // `output.walkthrough` is a pure post-process on the final video, so
         // honour it here too (issue #45): a pipeline that drives the stages
         // itself got chapters + poster and a silently ignored flag.
         if (sb.output?.walkthrough) await exportWalkthrough(project, sb);
       }
+      if (opts.strict && warningTotal > 0) {
+        process.exitCode = 1;
+        fail(
+          `--strict: ${warningTotal} compose warning(s) — see the grouped list above, ` +
+            `output/report.json and the frames in output/warnings/`
+        );
+      }
+    }
+  );
+
+program
+  .command("qa")
+  .argument("<dir>", "demo project directory")
+  .option("--lang <code>", "check the <code> language variant's video")
+  .option("--param <kv>", PARAM_OPT_DESC, collectKv, [])
+  .option("--json", "print the full JSON result", false)
+  .option("--strict", "exit 1 when any check warns", false)
+  .description(
+    "post-render checks on the finished MP4: blank open, blank poster, loudness, music bed, hold shares, cue readability, frame/chapter hygiene"
+  )
+  .action(
+    async (
+      dir: string,
+      opts: { lang?: string; param?: string[]; json?: boolean; strict?: boolean }
+    ) => {
+      const base = new Project(dir);
+      const storyboard = await base.loadStoryboard({ params: parseParams(opts.param) });
+      const project = new Project(dir, opts.lang);
+      const sb = opts.lang ? localizeStoryboard(storyboard, opts.lang) : storyboard;
+      const res = await runQa(project, sb);
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(res, null, 2) + "\n");
+      } else {
+        step(`demo QA: ${res.video}`);
+        logQa(res);
+      }
+      if (opts.strict && res.warnings > 0) process.exitCode = 1;
     }
   );
 
@@ -1069,6 +1165,7 @@ program
   .option("--langs <codes>", `${LANGS_OPT_DESC} — records ONCE, then renders each`)
   .option("--from-scene <id>", FROM_SCENE_OPT_DESC)
   .option("--no-replay", NO_REPLAY_OPT_DESC)
+  .option("--strict", STRICT_OPT_DESC, false)
   .description("run the full pipeline: voice → record → captions → compose")
   .action(
     async (
@@ -1090,9 +1187,20 @@ program
         langs?: string;
         fromScene?: string;
         replay?: boolean;
+        strict?: boolean;
       }
     ) => {
       applyTtsFlag(opts.tts);
+      let warningTotal = 0;
+      const strictGate = (): void => {
+        if (opts.strict && warningTotal > 0) {
+          process.exitCode = 1;
+          fail(
+            `--strict: ${warningTotal} compose warning(s) — see the grouped list above, ` +
+              `output/report.json and the frames in output/warnings/`
+          );
+        }
+      };
       const base = new Project(dir);
       await beginCommand(base, "render");
 
@@ -1153,7 +1261,11 @@ program
           })
         );
         await stageLog(base, "captions", () => captionsFor(base, storyboard));
-        await stageLog(base, "compose", () => compose(base, storyboard));
+        await stageLog(base, "compose", async () => {
+          const report = await compose(base, storyboard);
+          warningTotal += report.warnings.length;
+          return report;
+        });
         if (opts.gif) await stageLog(base, "gif", () => exportGif(base));
         // Screenshot mode: emit any `still` PNGs from the clean take (a
         // re-extract, not a re-record).
@@ -1165,6 +1277,7 @@ program
         }
         step("Done");
         ok(`▶ open ${base.outputPath}`);
+        strictGate();
         return;
       }
 
@@ -1195,11 +1308,16 @@ program
           generateVoice(project, sb, { force: opts.forceVoice })
         );
         await stageLog(project, "captions", () => captionsFor(project, sb));
-        await stageLog(project, "compose", () => compose(project, sb));
+        await stageLog(project, "compose", async () => {
+          const report = await compose(project, sb);
+          warningTotal += report.warnings.length;
+          return report;
+        });
         if (opts.gif) await stageLog(project, "gif", () => exportGif(project));
         ok(`▶ open ${project.outputPath}`);
       }
       step("Done");
+      strictGate();
     }
   );
 

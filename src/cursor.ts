@@ -24,7 +24,8 @@ export async function renderCursorPng(
   outPath: string,
   sizePx: number,
   style: "arrow" | "dot" = "arrow",
-  color = "rgba(255,90,95,.85)"
+  color = "rgba(255,90,95,.85)",
+  look: { outline?: string; outlineWidth?: number; halo?: boolean } = {}
 ): Promise<void> {
   // Logical canvas is 32 units (24 arrow + shadow headroom); scale to sizePx.
   const LOGICAL = 32;
@@ -40,15 +41,23 @@ export async function renderCursorPng(
       `<!doctype html><html><head><meta charset="utf-8"><style>
         html,body{margin:0;padding:0;background:transparent;}
         svg{position:absolute;left:0;top:0;
-          filter:drop-shadow(0 1px 2px rgba(0,0,0,.45));}
+          filter:${
+            look.halo
+              ? "drop-shadow(0 0 3px rgba(0,0,0,.65)) drop-shadow(0 0 7px rgba(0,0,0,.45))"
+              : "drop-shadow(0 1px 2px rgba(0,0,0,.45))"
+          };}
       </style></head><body>
         <svg width="${LOGICAL}" height="${LOGICAL}" viewBox="0 0 ${LOGICAL} ${LOGICAL}"
              xmlns="http://www.w3.org/2000/svg">
           ${
             style === "dot"
-              ? `<circle cx="16" cy="16" r="9" fill="${color}" stroke="rgba(255,255,255,.9)" stroke-width="2"/>`
+              ? `<circle cx="16" cy="16" r="9" fill="${color}" stroke="${
+                  look.outline ?? "rgba(255,255,255,.9)"
+                }" stroke-width="${look.outlineWidth ?? 2}"/>`
               : `<path d="${CURSOR_ARROW_PATH}" fill="${CURSOR_FILL}"
-            stroke="${CURSOR_STROKE}" stroke-width="1.3" stroke-linejoin="round"/>`
+            stroke="${look.outline ?? CURSOR_STROKE}" stroke-width="${
+              look.outlineWidth ?? 1.3
+            }" stroke-linejoin="round"/>`
           }
         </svg>
       </body></html>`,

@@ -13,6 +13,7 @@
 import { chromium, type Frame, type Page } from "playwright";
 import { chromeProfileDir } from "./config.js";
 import { ensureProfileUnlocked } from "./login.js";
+import { applySeeds, type Seeds } from "./setup.js";
 
 export interface InspectElement {
   /** ARIA role (explicit or implied by the tag). */
@@ -60,6 +61,13 @@ export interface InspectOptions {
   frames?: Record<string, string>;
   /** Settle time after load (ms, default 1200). */
   settleMs?: number;
+  /**
+   * Cookies / localStorage to inject before the first navigation — the same
+   * seeding `probe`/`record` do, so an authenticated page can be scanned
+   * (issue #53). Collect them with `collectSeeds` (storyboard `setup` +
+   * `--storage-state` / `--cookie`).
+   */
+  seeds?: Seeds | null;
 }
 
 const DEFAULT_LIMIT = 80;
@@ -199,6 +207,7 @@ export async function inspectPage(opts: InspectOptions): Promise<InspectResult> 
   });
   try {
     const page = context.pages()[0] ?? (await context.newPage());
+    if (opts.seeds) await applySeeds(context, page, opts.seeds);
     await page.goto(opts.url, { waitUntil: "domcontentloaded" });
     await page
       .waitForLoadState("networkidle", { timeout: 4000 })

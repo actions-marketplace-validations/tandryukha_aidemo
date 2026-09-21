@@ -13,8 +13,9 @@
  * be 60 % frozen frame before TTS is paid for.
  */
 
-import type { Storyboard, Scene, Action } from "./types.js";
+import { OUTPUT_PRESETS, type Storyboard, type Scene, type Action } from "./types.js";
 import { clampScaleForWidth } from "./zoom.js";
+import { compileUserRegex } from "./safe-regex.js";
 
 export type LintSeverity = "error" | "warn" | "info";
 
@@ -163,6 +164,9 @@ export function estimateActionMs(a: Action, autoIdle = false): number {
       return 800;
     case "back":
       return 1400; // like goto
+    case "dialog":
+      // Arming a handler costs nothing; `holdMs` pauses before answering.
+      return 20 + (a.holdMs ?? 0);
     default:
       return 300;
   }
@@ -359,14 +363,14 @@ export function lintStoryboard(
         for (const re of [a.textMatches, a.url]) {
           if (re == null) continue;
           try {
-            new RegExp(re);
+            compileUserRegex(re, "", "assert");
           } catch (e) {
             push({
               severity: "error",
               code: "assert-bad-regex",
               scene: scene.id,
               action: ai,
-              message: `\`assert\` regex ${JSON.stringify(re)} is invalid: ${(e as Error).message}`,
+              message: `\`assert\` regex ${JSON.stringify(re)} is unusable: ${(e as Error).message}`,
             });
           }
         }
@@ -569,6 +573,74 @@ export function lintStoryboard(
         code: "motionblur-scroll",
         message: `motionBlur is on and the storyboard scrolls ${scrolls} times — tmix smears scrolling text`,
         fix: "drop motionBlur on scroll-heavy demos (or use frames: 2)",
+      });
+    }
+  }
+
+  // --- legibility + framing (issues #51, #58) ---
+  const dsf = sb.video.deviceScaleFactor ?? 1;
+  const framePad = sb.frame?.padding ?? (sb.frame ? 48 : 0);
+  if (sb.video.width >= 1800 && dsf === 1) {
+    const contentPct = sb.frame
+      ? Math.round(((sb.video.width - 2 * framePad) / sb.video.width) * 100)
+      : 100;
+    push({
+      severity: "warn",
+      code: "viewport-legibility",
+      message:
+        `recording at ${sb.video.width}x${sb.video.height} CSS px: a desktop site lays out its ` +
+        `content column in the middle of that viewport, so body text ends up ~14px` +
+        (sb.frame ? ` inside a frame that keeps only ${contentPct}% of the canvas` : "") +
+        " — unreadable after the output downscale",
+      fix:
+        "record at 1280–1440 CSS px with `video.deviceScaleFactor: 2` and let `output.preset` " +
+        "scale the 2x raw down; the UI is a third bigger on screen and stays crisp",
+    });
+  }
+  const preset = sb.output?.preset ? OUTPUT_PRESETS[sb.output.preset] : null;
+  const outW = sb.output?.width ?? preset?.width;
+  const outH = sb.output?.height ?? preset?.height;
+  const fit = sb.output?.fit ?? preset?.fit ?? "contain";
+  if (outW && outH) {
+    const capAspect = sb.video.width / sb.video.height;
+    const outAspect = outW / outH;
+    if (fit === "contain" && Math.abs(capAspect - outAspect) / outAspect > 0.02) {
+      const barPx =
+        capAspect > outAspect
+          ? Math.round((outH - outW / capAspect) / 2)
+          : Math.round((outW - outH * capAspect) / 2);
+      const side = capAspect > outAspect ? "top and bottom" : "left and right";
+      push({
+        severity: "warn",
+        code: "output-letterbox",
+        message:
+          `capture is ${sb.video.width}x${sb.video.height} (${capAspect.toFixed(2)}:1) but the output ` +
+          `is ${outW}x${outH} (${outAspect.toFixed(2)}:1) with fit "contain" — ${barPx}px bars on the ${side}` +
+          (sb.frame ? ", on top of the frame padding's own bars" : ""),
+        fix:
+          `either record at the output's aspect (e.g. ${outH === 1080 ? "1600x900" : `${outW / 2}x${outH / 2}`} ` +
+          `with video.deviceScaleFactor: 2) or set output.fit: "cover" for an edge-to-edge cut`,
+      });
+    }
+  }
+
+  // --- opening frame (issue #47) ---
+  const firstScene = sb.scenes[0];
+  const opener = firstScene?.actions[0];
+  if (opener?.op === "goto") {
+    const settles = firstScene.actions
+      .slice(1)
+      .findIndex((a) => a.op === "waitFor" || a.op === "pause" || a.op === "waitForChange");
+    if (settles !== 0) {
+      push({
+        severity: "info",
+        code: "blank-open",
+        scene: firstScene.id,
+        action: 0,
+        message:
+          "the demo opens on a `goto` with nothing between it and the first beat — the video " +
+          "(and the poster) starts on the browser's white pre-paint while the first caption is already up",
+        fix: "follow the goto with a waitFor on the page's own content (or set `output.trimLeadingBlank: true`)",
       });
     }
   }

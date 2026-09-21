@@ -170,7 +170,8 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     console.error(`[mock-openai] error on ${req.method} ${path}:`, err.message ?? err);
     res.writeHead(500, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: { message: String(err.message ?? err) } }));
+    // Log the detail locally; the response says only that it failed.
+    res.end(JSON.stringify({ error: { message: "mock server error" } }));
   }
 });
 

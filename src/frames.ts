@@ -26,6 +26,14 @@ export interface FramesOptions {
   width?: number;
   /** Output directory. Default <demo>/output/frames. */
   outDir?: string;
+  /**
+   * Also tile the extracted frames into one contact sheet PNG
+   * (`output/frames/<source>-sheet.png`) — the single most useful review
+   * artifact for a finished cut (issue #52), and one image instead of 40.
+   */
+  sheet?: boolean;
+  /** Columns in the contact sheet. Default 5. */
+  sheetColumns?: number;
 }
 
 export interface FramesResult {
@@ -33,6 +41,8 @@ export interface FramesResult {
   durationMs: number;
   everySec: number;
   files: string[];
+  /** The contact sheet, when `sheet` was asked for. */
+  sheet?: string;
 }
 
 /** `mm-ss` (plus tenths when the cadence isn't whole seconds) — unique + sortable. */
@@ -52,7 +62,7 @@ export async function extractFrames(
   const everySec = Math.max(0.2, opts.everySec ?? 3);
   const width = Math.max(64, Math.round(opts.width ?? 640));
   const kind = opts.source ?? "final";
-  if (kind === "take") return takeFrames(project, everySec, width, opts.outDir);
+  if (kind === "take") return takeFrames(project, everySec, width, opts.outDir, opts);
   const source = kind === "raw" ? await project.resolveRawVideo() : project.outputPath;
   if (!(await exists(source))) {
     throw new Error(
@@ -76,8 +86,8 @@ export async function extractFrames(
     source,
     "-vf",
     `fps=1/${everySec},scale=${width}:-2`,
-    "-vsync",
-    "vfr",
+    // No `-vsync vfr` here: the `fps` filter already sets the rate, and
+    // ffmpeg 8 removed the option outright (portability baseline).
     pattern,
   ]);
   // ffmpeg numbers frames 0001…; rename to the timestamp each one represents.
@@ -92,7 +102,41 @@ export async function extractFrames(
     await fs.rename(join(outDir, f), join(outDir, name));
     files.push(join(outDir, name));
   }
-  return { source, durationMs, everySec, files };
+  const sheet = opts.sheet
+    ? await buildSheet(files, join(outDir, `${kind}-sheet.png`), opts.sheetColumns)
+    : undefined;
+  return { source, durationMs, everySec, files, ...(sheet ? { sheet } : {}) };
+}
+
+/**
+ * Tile frames into one contact sheet (ffmpeg `tile`). Uses the already-scaled
+ * PNGs as an image sequence, so no second decode of the video.
+ */
+export async function buildSheet(
+  files: string[],
+  outPath: string,
+  columns = 5
+): Promise<string | undefined> {
+  if (!files.length) return undefined;
+  const cols = Math.max(1, Math.min(10, columns));
+  const rows = Math.ceil(files.length / cols);
+  const inputs = files.flatMap((f) => ["-i", f]);
+  const chain =
+    files.map((_, i) => `[${i}:v]scale=480:-2,pad=iw+8:ih+8:4:4:color=0x11141c[t${i}]`).join(";") +
+    ";" +
+    files.map((_, i) => `[t${i}]`).join("") +
+    `concat=n=${files.length}:v=1:a=0,tile=${cols}x${rows}[sheet]`;
+  await runFfmpeg([
+    ...inputs,
+    "-filter_complex",
+    chain,
+    "-map",
+    "[sheet]",
+    "-frames:v",
+    "1",
+    outPath,
+  ]);
+  return outPath;
 }
 
 /**
@@ -106,7 +150,8 @@ async function takeFrames(
   project: Project,
   everySec: number,
   width: number,
-  outDirOpt?: string
+  outDirOpt?: string,
+  sheetOpts?: Pick<FramesOptions, "sheet" | "sheetColumns">
 ): Promise<FramesResult> {
   const timeline = TimelineSchema.parse(await readJson(project.timelinePath));
   const rawVideo = await project.resolveRawVideo();
@@ -150,10 +195,14 @@ async function takeFrames(
     carryMs = Math.max(0, carryMs + shot * stepMs - sceneMs);
     elapsedMs += sceneMs;
   }
+  const sheet = sheetOpts?.sheet
+    ? await buildSheet(files, join(outDir, "take-sheet.png"), sheetOpts.sheetColumns)
+    : undefined;
   return {
     source: [...sources].map((f) => relative(project.dir, f)).join(", "),
     durationMs: elapsedMs,
     everySec,
     files,
+    ...(sheet ? { sheet } : {}),
   };
 }

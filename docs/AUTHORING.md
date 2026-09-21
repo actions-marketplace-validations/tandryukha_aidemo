@@ -30,13 +30,14 @@ Every operation exists on both surfaces. Agents should prefer the MCP server
 | Scaffold a demo | `init_demo` (`fromUrl` drafts from a live page) | `aidemo init <name> [--from-url <url>]` |
 | Draft from a Playwright trace / test | `import_trace` | `aidemo import-trace <trace.zip \| spec.ts> --name <name>` |
 | Environment check | `doctor` | `aidemo doctor` |
-| Discover selectors on a page | `inspect` (job) | `aidemo inspect <url> [--dir <dir>] [--frame name=sel]` |
+| Discover selectors on a page | `inspect` (job) | `aidemo inspect <url> [--dir <dir>] [--frame name=sel] [--storage-state <f>] [--cookie k=v] [--no-setup]` |
 | Dry-run the flow | `probe` (job) | `aidemo probe <dir>` |
-| Full pipeline | `render` (job) | `aidemo render <dir>` |
+| Full pipeline | `render` (job) | `aidemo render <dir>` (`--strict` fails the run on compose warnings) |
 | One stage | `voice` / `record` / `captions` / `compose` (jobs) | `aidemo voice\|record\|captions\|compose <dir>` |
 | README GIF | `gif` (job) | `aidemo gif <dir>` |
 | Named stills (screenshot mode) | `stills` (job) | `aidemo stills <dir>` |
-| Frames for review | `frames` (job) | `aidemo frames <dir> [--every 3] [--source raw\|take]` |
+| Frames for review | `frames` (job) | `aidemo frames <dir> [--every 3] [--source raw\|take] [--sheet] [--columns 5]` |
+| Post-render QA report | `qa` (job) | `aidemo qa <dir> [--lang] [--json] [--strict]` |
 | Walkthrough export (HTML + Markdown + frames + captions) | `walkthrough` (job) | `aidemo walkthrough <dir> [--lang] [--width]` |
 | Job progress / result | `job_status`, `job_list`, `job_cancel` | (CLI runs block in the foreground) |
 
@@ -69,6 +70,13 @@ scan inside them). Use it instead of reading source or guessing: copy the
 first selector of the element you mean. It writes `logs/inspect-<ts>.json`
 and a screenshot next to it. Elements below the fold are listed too (marked
 `↓` on the CLI); a `scrollTo` on them works as usual.
+
+`inspect` runs the storyboard's **`setup`** block by default — preflight hook,
+`storageState`, cookies — so a gated app scans as the logged-in user instead of
+returning the login screen's selectors; it also picks up the storyboard's
+`video` size (so "in viewport" means what the take will see) and its `frames`
+map. Pass `--storage-state <file>` / `--cookie "k=v;domain=host"` for a one-off
+seed without touching the storyboard, or `--no-setup` to scan signed-out.
 
 **Lint before you spend a take.** `lint_storyboard` (CLI: `aidemo lint <dir>`)
 is a browser-free preflight that predicts what compose will do to each scene:
@@ -179,8 +187,9 @@ network.
 The precise contract is the JSON Schema from `get_storyboard_schema`
 (generated from the engine's own zod schema, `src/types.ts`).
 
-Top level: `title`, `language?`, `knownTerms?`, `targetLengthSeconds?`, `video{width,height}`
-(default 1280x720), `frames{ name: iframeSelector }`,
+Top level: `title`, `language?`, `knownTerms?`, `targetLengthSeconds?`,
+`video{width,height,deviceScaleFactor?}` (default 1280x720; see *Capture
+resolution*), `frames{ name: iframeSelector }`,
 `voice{voiceId,instructions,speed,pronounce?}` (default, scenes may override), `music?`,
 `zoom?`, `intro?`, `outro?`, `transition?`, `hold?`, `output?`, `setup?`,
 `attention?`, `keystrokes?`, `captions?`, `redact?`, `hide?`, `frame?`,
@@ -246,25 +255,31 @@ Cinematic keys (all opt-in; omit for the plain look):
   `output.loudness` (see below).
 - `transition: {type:"crossfade", durationMs?=400}` — **cross-dissolve every
   scene boundary** instead of hard-cutting (see below).
-- `hold: {mode?="freeze"|"drift", driftScale?=1.06, backoffMs?=0}` — what a
+- `hold: {mode?="freeze"|"drift", driftScale?=1.06, backoffMs?=0,
+  minDriftMs?=2000, driftInFrame?=false}` — what a
   scene shows while the narration outlasts its actions: a frozen frame
   (default) or a **slow Ken-Burns drift** so it never reads as a stall (see
   below).
-- `output: {width?, height?, fit?="contain", background?, loudness?}` — **render
+- `output: {width?, height?, fit?, background?, loudness?, trimLeadingBlank?,
+  blankOpenCapMs?}` — **render
   at a different size/aspect** (`width`+`height`, set together) and/or **set the
   master loudness** (`loudness`), e.g. a vertical social clip (see below).
 - `motionBlur: {frames?=3}` — **subtle motion blur** on fast motion (cursor,
   scroll, zoom pan); static UI stays sharp (see below).
-- `cursor: {hidden?, hideScenes?, scale?, style?, color?}` — **compose-time
-  cursor control**: hide, resize or restyle (`"arrow"` | `"dot"`) the cursor
-  post-hoc instead of baking it (see below).
-- `attention: {color?, clicks?}` — accent color for highlight/spotlight/callout
-  overlays; `clicks:true` draws a click ring wherever a click lands (needs the
-  `cursor` block). See *Attention*.
+- `cursor: {hidden?, hideScenes?, scale?, style?, color?, outline?,
+  outlineWidth?, halo?}` — **compose-time cursor control**: hide, resize,
+  restyle (`"arrow"` | `"dot"`) or re-contrast the cursor post-hoc instead of
+  baking it (see below).
+- `attention: {color?, clicks?, cursorClear?}` — accent color for
+  highlight/spotlight/callout overlays; `clicks:true` draws a click ring
+  wherever a click lands (needs the `cursor` block); `cursorClear:true` parks
+  the cursor off the element an attention beat is about, so the pointer never
+  sits on top of the thing you just highlighted. See *Attention*.
 - `keystrokes: true` — show a keystroke chip ("⌘ K", "Enter") on every `press`
   (per-action `keystrokes` overrides). See *Attention*.
 - `captions: {position?="bottom"|"top", style?="pill"|"bar"|"none", font?,
-  size?, color?, background?}` — caption strip placement and look; scenes may
+  size?, color?, background?, maxWords?, maxCueMs?, minCueMs?, maxLines?,
+  maxCharsPerLine?}` — caption strip placement and look; scenes may
   override `position` with their own `captions`. Compose also auto-flips a cue
   to the top while an overlay occupies the bottom band. See *Attention* and
   *Produced look*.
@@ -273,7 +288,7 @@ Cinematic keys (all opt-in; omit for the plain look):
 - `hide: [selector, …]` — hide elements at **record** time (teasers, cookie
   bars, ad slots); scenes may add their own `hide`. See *Attention*.
 - `frame: {padding?, background?, radius?, shadow?, chrome?="none"|"browser"|"mac",
-  safeTop?, title?, url?}` — pad the video onto a styled canvas with a rounded,
+  safeTop?, title?, url?}` (`url: "auto"` tracks the page per scene) — pad the video onto a styled canvas with a rounded,
   shadowed window and optional browser chrome. See *Produced look*.
 - `brand: {logo?, accent?, font?, watermark?}` — brand kit: accent for cards /
   frame tint / attention overlays, font for cards + captions + callouts +
@@ -295,7 +310,9 @@ Cinematic keys (all opt-in; omit for the plain look):
 
 Each scene: `id`, `title?` (chapter name), `narration`, `voice?`, `music?`,
 `zoom?` (false to disable), `autoIdle?` (overrides the top-level setting),
-`captions?`, `redact?`, `hide?`, `actions[]`.
+`transition?` (`false` hard-cuts *into* this scene, or an object overriding the
+top-level crossfade for that one boundary), `captions?`, `redact?`, `hide?`,
+`actions[]`.
 Narration may carry `{{@name}}` anchor markers (see *Narration-anchored
 beats*); the engine strips them at load and keeps the word index on the
 scene as `anchors` (don't author that field).
@@ -317,6 +334,13 @@ scene join is re-encoded (the default hard-cut path is a lossless stream-copy
 concat). Needs ≥2 scenes; a shorter `durationMs` (250–400) reads as a snappy
 dissolve, longer (600+) as a slow cinematic fade.
 
+A dissolve across a **navigation** ghosts — two unrelated pages bleed through
+each other — so compose hard-cuts any boundary where the next scene opens on a
+load or either side is a `goto`/`back`. Override per boundary with a scene's
+own `transition`: `"transition": false` on a scene forces a hard cut into it,
+and `"transition": {"durationMs": 700}` overrides the top-level timing for that
+one join. The compose log names every auto-cut boundary.
+
 **`hold: {mode?, driftScale?, backoffMs?}`** — controls the **hold** compose
 adds when a scene's narration runs longer than its (already x1.6-slowed)
 recording. By default the last frame is frozen for the remainder
@@ -326,14 +350,20 @@ default 1.06 ≈ 6% over the hold) — motion that reads as intentional rather
 than a stalled screen. `backoffMs` (0–2000) takes the held frame from that
 many ms *before* the scene's end instead of the very last frame, so a hold
 never lands on a half-drawn transition, a spinner, or a white flash at the
-tail of a navigation. Only scenes that actually hold are affected; a scene
+tail of a navigation. A drift that is too short reads as a jitter rather than a
+move, so drifts below `minDriftMs` (default 2000) fall back to a freeze; so
+does a drift inside a `frame` block, where the static window chrome makes the
+push-in obviously fake — set `driftInFrame: true` if you want it anyway. Compose
+logs each fallback (`drift hold → freeze`). Only scenes that actually hold are affected; a scene
 whose actions fill the narration is untouched, and a scene with no hold is
 byte-identical. The compose log and `output/report.json` list every scene's
 hold length and percentage; the lint predicts them before the take.
 
 **`output: {width, height, fit?, background?}`** — reframes the finished video
 (cards and captions already baked in) to a target size, applied as the last
-step. `fit`:
+step. `fit` defaults to `"contain"`, and a `preset`'s `fit` applies only when
+you don't set one — so `{"preset": "youtube", "fit": "cover"}` exports
+edge-to-edge with no letterbox bars. `fit`:
 - `"contain"` (default) — scale to fit inside `width×height` and pad the
   remainder with `background` (ffmpeg color syntax, e.g. `black`, `0x1a1a1a`;
   default black). Letterbox/pillarbox bars, nothing cropped.
@@ -460,6 +490,19 @@ moves the strip to the top edge. Without a per-scene override, compose
 box or a keystroke chip sitting in the bottom band, so a mark and a caption
 never collide (`report.json` → `attention.captionsFlipped`).
 
+**Cursor gets out of the way.** `attention: {cursorClear: true}` moves the
+pointer off the element a highlight/spotlight/callout is about (to the nearest
+free side, at record time) before the mark is drawn — otherwise the cursor
+often sits exactly on the thing you just asked the viewer to look at. Pair it
+with `hover {anchor:"edge"}` when you want a specific side.
+
+**Late layout.** Attention rects are measured after the element's box has been
+*stable* for a beat (bounded wait), and re-measured after the dwell: if the
+target moved more than ~24px in the meantime (a font swap, a lazy image, an
+async row) the take uses the settled position and records a warning on that
+action in `timeline.json` (also printed by record). A target that scrolled out
+of view warns too, instead of silently marking empty screen.
+
 **Redact (compose-time blur).** `redact: [{selector, frame?, blur?=14}]` at
 the top level and/or per scene. After every action the player re-measures
 each selector (all matches, up to 8) and logs a span per box; compose crops,
@@ -502,6 +545,11 @@ shadowed window on a styled canvas, with captions in the padding band below.
 - `radius` (default 14), `shadow` (default true).
 - `chrome`: `"browser"` (neutral dots + address pill) or `"mac"` (traffic
   lights). `url` (wins) or `title` fills the pill; omit both for an empty bar.
+  `"url": "auto"` **tracks the page**: each scene's pill shows the host (plus
+  path) the scene is actually on, taken from the take's `goto`s — use it for a
+  demo that moves between hosts, where one fixed address would be a lie. The
+  pill only changes at scene boundaries (it's a time-gated overlay, not a live
+  browser).
   For a phone-sized take (`video: {width: 390, height: 844}` — record at the
   mobile viewport) use `"iphone"` (rounded bezel + dynamic island) or
   `"android"` (bezel + punch-hole): no bar, `radius` defaults to 40, and the
@@ -559,7 +607,31 @@ frames, the SRT/VTT captions, and `walkthrough.json`. Frames come from the
 **Poster** (`output.poster: true`): also writes `output/poster.png`
 (`poster.<lang>.png` for language variants) — the first content frame after
 the intro card, for READMEs, social cards and `<video poster>`. The path is
-in `report.json` as `poster`.
+in `report.json` as `poster`. It skips past a blank opening (below), so the
+poster isn't a white rectangle; `"poster": 4200` takes the still at that
+millisecond instead, when you want a specific moment.
+
+**Blank opening** (`output.trimLeadingBlank: true`): a take that starts on a
+page still painting opens on white/blank frames. With this on, compose trims
+the flat lead of the first scene (capped by `output.blankOpenCapMs`, default
+1200) and re-aligns the scene's cursor, zoom and anchors to the trim. Compose
+always *measures* the opening either way and reports it as `blankOpenMs` plus
+a `blank-open` warning past ~400 ms; `aidemo lint` forecasts the same pitfall
+from a first scene that opens with a `goto` and no wait.
+
+## Capture resolution (`video.deviceScaleFactor`)
+
+`video: {width, height}` is the **logical** viewport — the CSS px the page
+lays out in. `deviceScaleFactor` (1–3, default 1) is how many real pixels each
+of those gets, exactly like a Retina display: `{"width": 1280, "height": 720,
+"deviceScaleFactor": 2}` records a 2560×1440 file of a 1280×720 page. Text and
+UI keep their on-screen *size* but get twice the pixels, which is the fix for
+a demo that looks soft after a zoom or a 1920 export, and for mobile-viewport
+takes whose small type turns to mush. Cost: bigger raw footage and a slower
+compose — 2 is enough for any delivery size; 3 is for stills. Bumping it
+changes the recording, so it's a re-record, not a recompose. `aidemo lint`
+warns when a viewport that small is about to be blown up on export
+(`viewport-legibility`).
 
 ## Motion blur & cursor
 
@@ -581,6 +653,10 @@ without re-recording**:
 - `hideScenes: ["s5"]` — hide the cursor only on those scenes (e.g. a
   full-screen result or confirmation).
 - `scale: 1.3` — resize the cursor (1 = the 24px baseline arrow).
+- `color`, `outline` (stroke color), `outlineWidth` (0–6) and `halo: true`
+  (a soft dark glow behind it) — make the cursor readable over a brand-colored
+  or busy surface, where a plain white arrow disappears. `halo` is the
+  one-key fix; `outline` is for matching a brand palette exactly.
 
 How it works: with a `cursor` block present, `record` leaves the take
 **cursor-free** and logs the cursor path into `timeline.json`; `compose` draws
@@ -603,12 +679,26 @@ for UI that re-renders under the cursor) and `anchor?` (land this action on a
   screen and the take doesn't get longer for it.
 - `{op:"type", target, text, humanize?}` — human-cadence typing
 - `{op:"press", key}` — e.g. "Enter"
-- `{op:"click", target, followPopup?}` · `{op:"hover", target}` —
+- `{op:"click", target, followPopup?}` · `{op:"hover", target, anchor?,
+  offset?}` — `anchor` (`"center"` default, or `"edge"|"top"|"bottom"|"left"|
+  "right"`) and `offset:{x,y}` aim the pointer at a *part* of the element:
+  `"anchor": "top"` hovers the top edge of a row so the tooltip it opens isn't
+  covered by the cursor, `"edge"` parks just outside it.
+  
   `followPopup:true` handles a link/button that opens a **new tab**
   (`target=_blank`, `window.open`): the tab is closed and the recorded tab
   navigates to its URL. The take is one window — a second tab is never in the
   video, so there is no `newTab`/`switchTab`; write the story in one tab.
 - `{op:"back"}` — browser history back, same readiness wait as `goto`.
+- `{op:"dialog", action?="accept"|"dismiss", promptText?, holdMs?, required?}`
+  — **arm a native dialog handler** for the *next* action in the scene.
+  `alert`/`confirm`/`window.print` and friends block the page and are invisible
+  to a recording otherwise (Playwright auto-dismisses an unhandled dialog, so
+  the take silently loses the step). Put the `dialog` action immediately
+  **before** the click that triggers it; `holdMs` waits before answering (the page
+  stays paused, so the moment reads as deliberate), `promptText`
+  answers a `window.prompt`, and `required: true` fails the scene if no dialog
+  ever appeared (the default is best-effort).
 - `{op:"select", target, value? | label?}` — native `<select>`: the cursor
   clicks it, the option is committed programmatically (the OS dropdown never
   paints into a recording), `change` fires.
@@ -1061,6 +1151,21 @@ scene's `anchors[]` shows `targetMs` / `landedMs` / `offMs`). A held scene
 is a storyboard problem, not a compose problem: give it on-screen beats or
 shorten its narration, then re-run `voice` + `compose`.
 
+Then run **`aidemo qa <dir>`** (MCP: the `qa` job) on the finished file — a
+browser-free, API-free audit of what actually shipped: length vs
+`targetLengthSeconds`, a blank opening or blank poster, master loudness (LUFS
+/ true peak) and whether the music bed is audible under the narration,
+per-scene hold percentage and compose warnings, caption cue stats, and
+hygiene checks (a fixed `frame.url` on a demo that visits several hosts, a
+non-English demo with ASCII-only chapter titles). `--json` for the structured
+report, `--strict` to exit non-zero on any finding.
+
+`render`/`compose` also take **`--strict`** (exit non-zero when compose emitted
+any warning — the CI gate), and every warning that has a moment on screen
+leaves a PNG in `output/warnings/<name>.png` so you can look at the frame
+instead of guessing. For a fast visual scan, `aidemo frames <dir> --sheet`
+writes a single contact-sheet PNG (`--columns`, default 5) next to the frames.
+
 Then play (or frame-extract — `aidemo frames <dir>` / the `frames` job)
 `output/final-demo.mp4`: cursor glides and clicks pulse, narration matches
 on-screen actions, captions are readable and in sync,
@@ -1213,6 +1318,15 @@ all) using each scene's measured duration from `voice.json`; only the timing
 *within* a scene is approximate (words spread proportional to length, not
 measured speech rhythm). `captions` logs a one-line reminder of this whenever
 the resolved language isn't English.
+
+**Cue segmentation.** Cues are broken at sentence ends first, then at clause
+punctuation, then before a conjunction, and only then on length — so a cue
+stops reading like it was cut mid-thought ("we open the" / "settings panel").
+Very short cues are merged forward. Tune per storyboard under `captions`:
+`maxWords` (12), `maxCueMs` (6000), `minCueMs` (1000), `maxLines` (2),
+`maxCharsPerLine` (38). `captions` logs the resulting cue stats (count, median
+length, how many fall under `minCueMs`), and `aidemo qa` flags a run with lots
+of flash cues or mid-clause splits.
 
 ## Multi-language renders (one take, N languages)
 
