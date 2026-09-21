@@ -27,6 +27,7 @@ export type JobKind =
   | "gif"
   | "stills"
   | "frames"
+  | "qa"
   | "inspect"
   | "walkthrough";
 

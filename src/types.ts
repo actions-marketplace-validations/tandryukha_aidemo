@@ -133,6 +133,15 @@ export const ActionSchema = z.discriminatedUnion("op", [
     ...BaseAction,
     op: z.literal("hover"),
     target: TargetSchema,
+    /**
+     * Where the pointer parks relative to the element. Default "center" — but
+     * on a small chip or a number the narration is about, the cursor then
+     * COVERS the thing it points at (issue #50). "edge" (or a side) parks it
+     * just outside the element's box, still close enough to read as pointing.
+     */
+    anchor: z.enum(["center", "edge", "top", "bottom", "left", "right"]).optional(),
+    /** Extra nudge from the anchor point, CSS px. */
+    offset: z.object({ x: z.number(), y: z.number() }).optional(),
   }),
   z.object({
     ...BaseAction,
@@ -376,6 +385,35 @@ export const ActionSchema = z.discriminatedUnion("op", [
   }),
   /** Browser back (history), with the same readiness wait as `goto`. */
   z.object({ ...BaseAction, op: z.literal("back") }),
+  /**
+   * Arm a one-shot handler for the NEXT native dialog (`alert`, `confirm`,
+   * `prompt`, `beforeunload`) so the action that triggers it actually goes
+   * through (issue #54). Playwright auto-DISMISSES dialogs when nothing is
+   * listening, so without this a filmed click on an "Archive this?" button
+   * looks like it worked while the handler never ran — a false outcome on
+   * camera. Put the `dialog` action immediately BEFORE the click that opens it.
+   *
+   * The dialog itself is chrome, not page content, so it is not visible in the
+   * take; `holdMs` only paces the beat before answering.
+   */
+  z.object({
+    ...BaseAction,
+    op: z.literal("dialog"),
+    /** Answer the dialog with OK (default) or Cancel. */
+    action: z.enum(["accept", "dismiss"]).default("accept"),
+    /** Text typed into a `prompt()` before accepting. */
+    promptText: z.string().optional(),
+    /** Wait this long before answering, ms. Default 0. */
+    holdMs: z.number().min(0).max(5000).optional(),
+    /** How long to wait for the dialog to appear before warning, ms. Default 5000. */
+    timeoutMs: z.number().optional(),
+    /**
+     * Set false when the dialog is not guaranteed to open — the take then only
+     * notes that none came. Default true: a `dialog` whose dialog never fired
+     * fails the take, because the filmed action silently did nothing.
+     */
+    required: z.boolean().optional(),
+  }),
 ]);
 export type Action = z.infer<typeof ActionSchema>;
 
@@ -449,6 +487,22 @@ export const CaptionsConfigSchema = z.object({
   color: z.string().optional(),
   /** Pill/bar background (CSS). Default rgba(12,14,22,.66). */
   background: z.string().optional(),
+  /**
+   * Cue segmentation (storyboard level only — per-scene overrides just move
+   * the strip). Defaults follow broadcast practice: up to 2 lines of ~38
+   * characters, 1–6 s per cue, broken at punctuation and conjunctions rather
+   * than at a hard word count (issue #48).
+   */
+  /** Max words per cue. Default 12 (≈2 lines). */
+  maxWords: z.number().int().min(2).max(30).optional(),
+  /** Max cue length, ms. Default 6000. */
+  maxCueMs: z.number().min(500).max(12000).optional(),
+  /** Cues shorter than this are merged into a neighbour where they fit, ms. Default 1000. */
+  minCueMs: z.number().min(0).max(4000).optional(),
+  /** Lines a cue may occupy. Default 2. */
+  maxLines: z.number().int().min(1).max(3).optional(),
+  /** Characters per line used to size a cue. Default 38. */
+  maxCharsPerLine: z.number().int().min(16).max(80).optional(),
 });
 export type CaptionsConfig = z.infer<typeof CaptionsConfigSchema>;
 
@@ -458,6 +512,12 @@ export const AttentionConfigSchema = z.object({
   color: z.string().optional(),
   /** Draw a click ring where every click lands (compose-time cursor only). */
   clicks: z.boolean().optional(),
+  /**
+   * Move the cursor out of the way before a highlight/spotlight/callout/focus
+   * beat, so the pointer never sits on top of the value being showcased
+   * (issue #50). Opt-in; the cursor glides to just outside the target's box.
+   */
+  cursorClear: z.boolean().optional(),
 });
 export type AttentionConfig = z.infer<typeof AttentionConfigSchema>;
 
@@ -491,6 +551,12 @@ export const FrameSchema = z.object({
   safeTop: z.union([z.boolean(), z.number().min(0).max(120)]).optional(),
   /** Text in the chrome's address pill (url wins over title). */
   title: z.string().optional(),
+  /**
+   * Address-pill text. `"auto"` tracks the page: each scene's pill shows the
+   * host of the URL that scene is actually on (from the take's `goto`s), so a
+   * demo that moves between hosts stops printing one fixed address over all of
+   * them (issue #52). Any other string is used verbatim for the whole video.
+   */
   url: z.string().optional(),
 });
 export type Frame = z.infer<typeof FrameSchema>;
@@ -534,6 +600,20 @@ export const AutoIdleSchema = z.object({
 });
 export type AutoIdle = z.infer<typeof AutoIdleSchema>;
 
+/**
+ * Scene-to-scene transition (opt-in). When present, compose crossfades the
+ * video across every scene boundary instead of hard-cutting. The overlap is
+ * stolen from each scene's own frozen tail so the timeline does NOT shrink —
+ * total duration and per-scene narration alignment are preserved exactly.
+ * Omit the key for the default hard cuts (unchanged stream-copy concat).
+ */
+export const TransitionSchema = z.object({
+  type: z.literal("crossfade"),
+  /** Crossfade length, ms. Default 400. */
+  durationMs: z.number().default(400),
+});
+export type Transition = z.infer<typeof TransitionSchema>;
+
 export const SceneSchema = z.object({
   id: z.string(),
   /** Chapter title for this beat (`output.chapters`); defaults to the scene id. */
@@ -565,6 +645,14 @@ export const SceneSchema = z.object({
   autoIdle: z.boolean().optional(),
   /** Caption placement for this scene (overrides top-level `captions.position`). */
   captions: CaptionsConfigSchema.optional(),
+  /**
+   * Override the storyboard `transition` at the boundary ENTERING this scene:
+   * `false` hard-cuts into it, an object changes the crossfade. Use it when a
+   * dissolve would ghost — e.g. this scene opens on a new page still painting
+   * (issue #49). Boundaries that cross a navigation hard-cut automatically;
+   * this is the manual override.
+   */
+  transition: z.union([z.literal(false), TransitionSchema]).optional(),
   /** Blur these regions while this scene records (adds to top-level `redact`). */
   redact: z.array(RedactSchema).optional(),
   /** Hide these selectors for this scene (adds to top-level `hide`). */
@@ -656,6 +744,16 @@ export const CursorConfigSchema = z.object({
   style: z.enum(["arrow", "dot"]).optional(),
   /** Dot style only: fill color. Default rgba(255,90,95,.85). */
   color: z.string().optional(),
+  /**
+   * Outline drawn around the pointer so it stays findable on brand-coloured
+   * UI (a gold dot on a gold chip disappears — issue #50). CSS color; default
+   * rgba(255,255,255,.9) for "dot", the arrow's dark stroke otherwise.
+   */
+  outline: z.string().optional(),
+  /** Outline thickness in cursor units (the pointer is 24 wide). Default 2. */
+  outlineWidth: z.number().min(0).max(6).optional(),
+  /** Soft contrasting halo behind the pointer — findable on any background. */
+  halo: z.boolean().optional(),
 });
 export type CursorConfig = z.infer<typeof CursorConfigSchema>;
 
@@ -686,19 +784,6 @@ export const CardSchema = z.object({
 });
 export type Card = z.infer<typeof CardSchema>;
 
-/**
- * Scene-to-scene transition (opt-in). When present, compose crossfades the
- * video across every scene boundary instead of hard-cutting. The overlap is
- * stolen from each scene's own frozen tail so the timeline does NOT shrink —
- * total duration and per-scene narration alignment are preserved exactly.
- * Omit the key for the default hard cuts (unchanged stream-copy concat).
- */
-export const TransitionSchema = z.object({
-  type: z.literal("crossfade"),
-  /** Crossfade length, ms. Default 400. */
-  durationMs: z.number().default(400),
-});
-export type Transition = z.infer<typeof TransitionSchema>;
 
 /**
  * Master loudness target for the final muxed audio (ffmpeg `loudnorm`). Lands
@@ -747,8 +832,22 @@ export const OutputSchema = z
     preset: OutputPresetSchema.optional(),
     /** Write MP4 chapter markers, one per scene (scene `title` or id). Default false. */
     chapters: z.boolean().optional(),
-    /** Also extract output/poster.png (first content frame after the intro). Default false. */
-    poster: z.boolean().optional(),
+    /**
+     * Also extract output/poster.png. `true` picks the first frame after the
+     * intro card that actually shows CONTENT (a blank white load frame is
+     * skipped — issue #47); a number picks the frame at that ms of the final
+     * video instead. Default false.
+     */
+    poster: z.union([z.boolean(), z.number().min(0)]).optional(),
+    /**
+     * Drop the browser's blank pre-paint at the very start of the video, so
+     * the demo opens on the product instead of on ~0.5 s of white under the
+     * first caption (issue #47). At most `blankOpenCapMs` of the leading flat
+     * span is kept. Default false (unchanged opening).
+     */
+    trimLeadingBlank: z.boolean().optional(),
+    /** With `trimLeadingBlank`: leading blank kept, ms. Default 100. */
+    blankOpenCapMs: z.number().min(0).max(2000).optional(),
     /**
      * Also export output/walkthrough/ (index.html + guide.md + per-scene
      * frames + captions) after every render. Default false; `aidemo
@@ -759,9 +858,12 @@ export const OutputSchema = z
     height: z.number().optional(),
     /**
      * "contain" (default) = scale to fit + pad the remainder (letterbox bars).
-     * "cover" = scale to fill + center-crop the overflow (no bars).
+     * "cover" = scale to fill + center-crop the overflow (no bars) — the
+     * edge-to-edge answer when the capture's aspect differs from the
+     * preset's (issue #58). Set explicitly it also wins over a `preset`'s
+     * own fit; leave it out to take the preset's.
      */
-    fit: z.enum(["contain", "cover"]).default("contain"),
+    fit: z.enum(["contain", "cover"]).optional(),
     /** Pad color for "contain" (ffmpeg color syntax, e.g. black, 0x1a1a1a). Default black. */
     background: z.string().optional(),
     /**
@@ -797,6 +899,20 @@ export const HoldSchema = z.object({
   driftScale: z.number().min(1).max(1.5).default(1.06),
   /** Take the held frame this many ms before the segment end. Default 0. */
   backoffMs: z.number().min(0).max(2000).default(0),
+  /**
+   * Shortest hold that still drifts, ms. Default 2000: a 6-px push over a
+   * second reads as a bob — a jitter bug — not as a dwell, so short holds
+   * freeze instead (issue #57).
+   */
+  minDriftMs: z.number().min(0).max(20000).default(2000),
+  /**
+   * Drift even when a window `frame.chrome` is composited around the video.
+   * Default false: the drift zooms the captured PAGE while the drawn browser
+   * chrome stays put, so the eye — locked on the static window edge and the
+   * sticky header — sees the page sliding inside its frame, i.e. a scroll
+   * glitch. Such scenes freeze instead unless you set this (issue #57).
+   */
+  driftInFrame: z.boolean().default(false),
 });
 export type HoldConfig = z.infer<typeof HoldSchema>;
 
@@ -891,9 +1007,27 @@ export const StoryboardSchema = z.object({
    */
   params: z.record(z.string(), z.string()).optional(),
   targetLengthSeconds: z.number().optional(),
-  /** Recording viewport / video size. Default 1280x720. */
+  /**
+   * Recording viewport (CSS px) and, with `deviceScaleFactor`, the raw video
+   * size. Default 1280x720.
+   */
   video: z
-    .object({ width: z.number(), height: z.number() })
+    .object({
+      width: z.number(),
+      height: z.number(),
+      /**
+       * Record the video at `width*n x height*n` pixels while the PAGE still
+       * lays out at `width x height` CSS px — the standard fix for "the
+       * product is unreadable" (issue #51). A desktop app recorded at a
+       * 1920-px viewport renders its 1200-px content column tiny; record at
+       * 1280–1440 CSS px with `deviceScaleFactor: 2` instead and let
+       * `output.preset` scale the 2x raw down to 1080p: the UI is a third
+       * bigger on screen and stays crisp. Default 1 (unchanged output).
+       * Built-in (Playwright) capture only — native/OBS capture records real
+       * screen pixels.
+       */
+      deviceScaleFactor: z.number().min(1).max(3).optional(),
+    })
     .default({ width: 1280, height: 720 }),
   /** Named frames used by actions, mapping name -> iframe selector. */
   frames: z.record(z.string(), z.string()).default({}),
@@ -1165,6 +1299,8 @@ export const ComposeReportSchema = z.object({
   hold: z.string(),
   /** output/poster.png when `output.poster` is set. */
   poster: z.string().optional(),
+  /** Ms of blank (contentless) video at the very start of the final cut. */
+  blankOpenMs: z.number().optional(),
   warnings: z.array(ComposeWarningSchema),
 });
 export type ComposeReport = z.infer<typeof ComposeReportSchema>;

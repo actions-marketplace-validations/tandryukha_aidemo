@@ -50,6 +50,7 @@ import {
   runFfmpeg,
   probeDurationMs,
   probeFlatTailMs,
+  probeFlatLeadMs,
   probeVideoDims,
   probeFreezeSpans,
   type FreezeSpan,
@@ -97,6 +98,13 @@ export async function compose(
   const warn = (code: string, message: string, scene?: string): void => {
     warnings.push({ code, message, ...(scene ? { scene } : {}) });
   };
+  /**
+   * Frames to dump next to a warning (issue #59): an agent cannot look at the
+   * MP4, so "the reward is on screen for 0.3 s" is only actionable with the
+   * frame at that moment attached. Content-time ms; the intro shift is added
+   * when they are extracted, after the final mux.
+   */
+  const warningFrames: Array<{ name: string; atMs: number }> = [];
   const hold = HoldSchema.parse(storyboard.hold ?? {});
   if (await warnStaleCaptions(project)) {
     warn(
@@ -182,6 +190,10 @@ export async function compose(
     cursorCfg?.style === "dot" ? Math.round(16 * pxScale * (cursorCfg.scale ?? 1)) : 0;
 
   const sceneVideos: string[] = [];
+  /** timeline scenes that actually produced a segment, parallel to sceneVideos. */
+  const composedTl: Timeline["scenes"] = [];
+  /** content-time span of each composed scene, for `frame.url: "auto"`. */
+  const sceneSpans: Array<{ a: number; b: number }> = [];
   const sceneTotal = timeline.scenes.length;
   for (let i = 0; i < timeline.scenes.length; i++) {
     const tl = timeline.scenes[i];
@@ -217,6 +229,23 @@ export async function compose(
     await extractAndConcat(sceneRaw, keeps, rawSegPath, tmp, i);
 
     let srcMs = await probeDurationMs(rawSegPath);
+    // #47: the take opens on the browser's white pre-paint (the `goto` load),
+    // so the first caption plays over a blank page and `poster` grabs white.
+    // Trim it down to a sliver — opt-in, so an unchanged storyboard renders
+    // byte-for-byte as before.
+    let leadTrimMs = 0;
+    if (i === 0 && storyboard.output?.trimLeadingBlank && srcMs > 1000) {
+      const cap = storyboard.output.blankOpenCapMs ?? 100;
+      const flatLead = await probeFlatLeadMs(rawSegPath);
+      if (flatLead > cap + 80) {
+        leadTrimMs = Math.min(flatLead - cap, srcMs - 500);
+        srcMs -= leadTrimMs;
+        log(
+          `scene ${tl.id}: trimmed ${Math.round(leadTrimMs)}ms of blank opening ` +
+            `(kept ${cap}ms of it)`
+        );
+      }
+    }
     // A scene that ends right before a `goto` can trail off into the browser's
     // white pre-paint. Freeze-holding THAT frame paints seconds of solid white
     // (issue #36), so drop a flat tail before deciding how long to hold —
@@ -229,6 +258,13 @@ export async function compose(
         srcMs = trimTo;
       }
     }
+    /**
+     * Raw video ms → offset inside this scene's kept, head-trimmed footage.
+     * Every event remap goes through it, so the leading-blank trim shifts the
+     * whole scene's timeline consistently.
+     */
+    const localIn = (rawT: number): number =>
+      Math.max(0, offsetInKeeps(keeps, rawT) - leadTrimMs);
     // Retime the segment toward the narration length, but only within
     // [MIN_FACTOR, MAX_STRETCH]. If narration still needs more time, hold
     // (freeze) the last frame for the remainder — natural for a static page,
@@ -252,7 +288,7 @@ export async function compose(
         if (wi == null) continue;
         const target = wordStartMs(words, sceneDef?.narration ?? "", wi);
         if (target == null) continue;
-        const raw = offsetInKeeps(keeps, ev.tMs + leadInMs);
+        const raw = localIn(ev.tMs + leadInMs);
         if (raw > srcMs - 40) {
           warn(
             "anchor-unreachable",
@@ -292,6 +328,10 @@ export async function compose(
             offMs,
           });
           if (Math.abs(offMs) > 150) {
+            warningFrames.push({
+              name: `${tl.id}-${bnd.name}`,
+              atMs: outCursorMs + Math.max(0, Math.min(out, targetMs)),
+            });
             warn(
               "anchor-unreachable",
               `scene ${tl.id}: anchor "${bnd.name}" lands ${Math.abs(offMs)}ms ${offMs > 0 ? "after" : "before"} its word even at ${offMs > 0 ? "2x speed" : "x1.6 slow-motion"} — ${
@@ -336,8 +376,25 @@ export async function compose(
     const backoffMs = holding
       ? Math.min(hold.backoffMs, Math.max(0, stretchedMs - 500))
       : 0;
-    const driftHold = holding && hold.mode === "drift";
+    // Drift only where it reads as a camera move (issue #57): a short hold
+    // bobs, and inside a composited window chrome the page appears to slide
+    // within a frame that does not move with it.
+    const framedChrome =
+      !!storyboard.frame && (storyboard.frame.chrome ?? "none") !== "none";
+    const driftSuppressed =
+      holding && hold.mode === "drift"
+        ? holdMs < hold.minDriftMs
+          ? `hold is ${Math.round(holdMs)}ms (< hold.minDriftMs ${hold.minDriftMs}ms)`
+          : framedChrome && !hold.driftInFrame
+            ? `frame.chrome "${storyboard.frame!.chrome}" is static — the drift would read as the page sliding inside it (set hold.driftInFrame to override)`
+            : null
+        : null;
+    if (driftSuppressed) log(`scene ${tl.id}: drift hold → freeze (${driftSuppressed})`);
+    const driftHold = holding && hold.mode === "drift" && !driftSuppressed;
     let vf = "";
+    if (leadTrimMs > 0) {
+      vf += `trim=start=${(leadTrimMs / 1000).toFixed(3)},setpts=PTS-STARTPTS,`;
+    }
     if (blankTrimMs > 0) {
       vf += `trim=duration=${(srcMs / 1000).toFixed(3)},setpts=PTS-STARTPTS,`;
     }
@@ -382,7 +439,7 @@ export async function compose(
       for (const ev of tl.focusEvents ?? []) {
         sceneFocus++;
         const rawT = ev.tMs + leadInMs;
-        const local = stretchLocal(offsetInKeeps(keeps, rawT));
+        const local = stretchLocal(localIn(rawT));
         zoomEvents.push({
           tMs: outCursorMs + Math.min(local, stretchedMs),
           x: ev.x * pxScale,
@@ -400,7 +457,7 @@ export async function compose(
       const sceneStart = outCursorMs;
       for (const s of tl.cursorSamples ?? []) {
         const rawT = s.tMs + leadInMs;
-        const local = stretchLocal(offsetInKeeps(keeps, rawT));
+        const local = stretchLocal(localIn(rawT));
         cursorPts.push({
           t: (outCursorMs + Math.min(local, stretchedMs)) / 1000,
           x: s.x * pxScale - dotOffset,
@@ -420,7 +477,7 @@ export async function compose(
       const sceneStart = outCursorMs;
       const sceneEnd = outCursorMs + stretchedMs + (holdMs > 40 ? holdMs : 0);
       const toContent = (rawMs: number): number =>
-        sceneStart + Math.min(stretchLocal(offsetInKeeps(keeps, rawMs + leadInMs)), stretchedMs);
+        sceneStart + Math.min(stretchLocal(localIn(rawMs + leadInMs)), stretchedMs);
       for (const ev of tl.attentionEvents ?? []) {
         const a = toContent(ev.tMs);
         const b = Math.min(sceneEnd, a + ev.holdMs);
@@ -450,6 +507,7 @@ export async function compose(
       if (pos) captionWindows.push({ a: sceneStart, b: sceneEnd, position: pos });
     }
 
+    const sceneContentStartMs = outCursorMs;
     outCursorMs += stretchedMs + (holdMs > 40 ? holdMs : 0);
 
     let scenePath = resolve(tmp, `scene-${i}.mp4`);
@@ -482,12 +540,14 @@ export async function compose(
       );
     }
     sceneVideos.push(scenePath);
+    composedTl.push(tl);
+    sceneSpans.push({ a: sceneContentStartMs, b: outCursorMs });
     const holdPct = holding ? holdMs / targetMs : 0;
     log(
       `scene ${tl.id}: ${srcMs}ms -> ${targetMs}ms ` +
         `(x${factor.toFixed(2)}${
           holding
-            ? ` + ${Math.round(holdMs)}ms ${hold.mode === "drift" ? "drift " : ""}hold` +
+            ? ` + ${Math.round(holdMs)}ms ${driftHold ? "drift " : ""}hold` +
               (backoffMs > 0 ? ` (backoff ${backoffMs}ms)` : "")
             : ""
         }${
@@ -514,11 +574,23 @@ export async function compose(
       ...(anchorReport.length ? { anchors: anchorReport } : {}),
     });
     if (holdPct > FREEZE_WARN_PCT) {
+      // Name the exact frame being held (issue #55): when the wrong one is
+      // frozen — the next page's load, a half-painted card — the only way to
+      // see it today is to extract frames by hand.
+      const heldRaw = rawAtKeepOffset(
+        keeps,
+        leadTrimMs + Math.max(0, srcMs - backoffMs / Math.max(factor, 0.01))
+      );
+      warningFrames.push({
+        name: `${tl.id}-held`,
+        atMs: sceneContentStartMs + stretchedMs + 200,
+      });
       warn(
         "scene-freeze",
         `scene ${tl.id}: ${Math.round(holdPct * 100)}% of its ${(targetMs / 1000).toFixed(1)}s ` +
           `is a held frame (${(srcMs / 1000).toFixed(1)}s of action for ` +
-          `${(targetMs / 1000).toFixed(1)}s of narration) — add on-screen action ` +
+          `${(targetMs / 1000).toFixed(1)}s of narration; the held frame is ` +
+          `${relative(project.dir, sceneRaw)} @ ${stampMs(heldRaw)}) — add on-screen action ` +
           `(hover/scroll/focus beats, a pause) or shorten the narration`,
         tl.id
       );
@@ -549,14 +621,43 @@ export async function compose(
   // scene boundaries (re-encodes the join; total duration is preserved).
   let content: string;
   if (storyboard.transition && sceneVideos.length >= 2) {
-    const durMs = storyboard.transition.durationMs;
+    const baseDur = storyboard.transition.durationMs;
+    // Per-boundary duration; 0 = hard cut. A boundary that crosses a page
+    // navigation dissolves the old page over a still-painting new one — a
+    // ghost double-image (issue #49) — so cut those, and honour an explicit
+    // per-scene override either way.
+    const durations: number[] = [];
+    const autoCut: string[] = [];
+    for (let b = 1; b < sceneVideos.length; b++) {
+      const scene = sceneById.get(composedTl[b].id);
+      if (scene?.transition === false) {
+        durations.push(0);
+        continue;
+      }
+      if (scene?.transition) {
+        durations.push(scene.transition.durationMs);
+        continue;
+      }
+      if (crossesNavigation(composedTl[b - 1], composedTl[b])) {
+        durations.push(0);
+        autoCut.push(composedTl[b].id);
+        continue;
+      }
+      durations.push(baseDur);
+    }
+    const fades = durations.filter((d) => d > 0).length;
     log(
-      `scene crossfade: ${durMs}ms x ${sceneVideos.length - 1} boundary/ies`
+      `scene crossfade: ${baseDur}ms x ${fades} boundary/ies` +
+        (durations.length - fades
+          ? `, ${durations.length - fades} hard cut(s)` +
+            (autoCut.length ? ` (navigation into ${autoCut.join(", ")})` : "")
+          : "")
     );
     content = await crossfadeScenes(
       sceneVideos,
-      durMs,
-      resolve(tmp, "content.mp4")
+      durations,
+      resolve(tmp, "content.mp4"),
+      tmp
     );
   } else {
     content = await concatSegments(
@@ -653,7 +754,12 @@ export async function compose(
           png,
           Math.round(32 * pxScale * cScale),
           cursorCfg.style ?? "arrow",
-          cursorCfg.color
+          cursorCfg.color,
+          {
+            ...(cursorCfg.outline ? { outline: cursorCfg.outline } : {}),
+            ...(cursorCfg.outlineWidth != null ? { outlineWidth: cursorCfg.outlineWidth } : {}),
+            ...(cursorCfg.halo ? { halo: true } : {}),
+          }
         );
         const withCursor = resolve(tmp, "content-cursor.mp4");
         await runFfmpeg([
@@ -796,25 +902,49 @@ export async function compose(
   let canvasH = outH;
   const outCfg = resolveOutputSizing(storyboard.output);
   if (storyboard.frame) {
-    const framePng = resolve(tmp, "frame.png");
-    const layout = await renderFramePng(
-      storyboard.frame,
-      storyboard.brand,
-      framePng,
-      storyboard.video.width,
-      storyboard.video.height,
-      pxScale,
-      outCfg.width != null && outCfg.height != null ? outCfg.width / outCfg.height : undefined
-    );
+    // `frame.url: "auto"` tracks the page: one frame PNG per distinct address,
+    // time-gated to the scenes that are on it (#52). Everything else renders a
+    // single static frame, exactly as before.
+    const autoUrl = storyboard.frame.url === "auto";
+    const spans = autoUrl ? frameUrlSpans(composedTl, sceneSpans) : [];
+    const labels = autoUrl ? [...new Set(spans.map((sp) => sp.label))] : [""];
+    const framePngs: string[] = [];
+    let layout!: Awaited<ReturnType<typeof renderFramePng>>;
+    for (let li = 0; li < labels.length; li++) {
+      const framePng = resolve(tmp, `frame-${li}.png`);
+      layout = await renderFramePng(
+        autoUrl ? { ...storyboard.frame, url: labels[li] || undefined } : storyboard.frame,
+        storyboard.brand,
+        framePng,
+        storyboard.video.width,
+        storyboard.video.height,
+        pxScale,
+        outCfg.width != null && outCfg.height != null ? outCfg.width / outCfg.height : undefined
+      );
+      framePngs.push(framePng);
+    }
     const framed = resolve(tmp, "content-framed.mp4");
+    // Each frame PNG covers the whole canvas and the spans partition the
+    // timeline, so exactly one overlay is enabled at any instant.
+    const chain = framePngs
+      .map((_, li) => {
+        const win = spans
+          .filter((sp) => sp.label === labels[li])
+          .map((sp) => `between(t,${(sp.a / 1000).toFixed(3)},${(sp.b / 1000).toFixed(3)})`)
+          .join("+");
+        const gate = autoUrl && framePngs.length > 1 ? `:enable='${win}'` : "";
+        const src = li === 0 ? "[p]" : `[v${li - 1}]`;
+        const dst = li === framePngs.length - 1 ? "[vout]" : `[v${li}]`;
+        return `${src}[${li + 1}:v]overlay=0:0:format=auto${gate}${dst}`;
+      })
+      .join(";");
     await runFfmpeg([
       "-i",
       content,
-      "-i",
-      framePng,
+      ...framePngs.flatMap((f) => ["-i", f]),
       "-filter_complex",
       `[0:v]pad=${layout.canvasW}:${layout.canvasH}:${layout.offsetX}:${layout.offsetY}:color=${layout.padColor}[p];` +
-        `[p][1:v]overlay=0:0:format=auto[vout]`,
+        chain,
       "-map",
       "[vout]",
       "-an",
@@ -835,7 +965,8 @@ export async function compose(
     canvasH = layout.canvasH;
     log(
       `frame: ${layout.canvasW}x${layout.canvasH} canvas (padding ${storyboard.frame.padding ?? 48}` +
-        `${storyboard.frame.chrome && storyboard.frame.chrome !== "none" ? `, ${storyboard.frame.chrome} chrome` : ""})`
+        `${storyboard.frame.chrome && storyboard.frame.chrome !== "none" ? `, ${storyboard.frame.chrome} chrome` : ""})` +
+        (autoUrl ? `, auto url: ${labels.filter(Boolean).join(" -> ") || "(none)"}` : "")
     );
   }
   const logicalW = canvasW / pxScale;
@@ -963,12 +1094,28 @@ export async function compose(
     : null;
   await muxAudio(project, storyboard, finalVideo, introMs, chapters);
   ok(`final video → ${project.outputPath}`);
+  // Blank-open measurement + poster (issue #47). The poster used to be taken
+  // at a fixed offset, which on a demo that opens with a `goto` is exactly the
+  // white load frame; pick the first frame that actually shows content instead.
+  const blankOpenMs = await probeFlatLeadMs(project.outputPath, 4000, introMs).catch(() => 0);
+  if (blankOpenMs > 250) {
+    warn(
+      "blank-open",
+      `the video opens on ${Math.round(blankOpenMs)}ms of blank page${storyboard.intro ? " after the intro card" : ""} ` +
+        `(the first scene's load) — ` +
+        `set output.trimLeadingBlank, or wait on the page's content before the first beat`
+    );
+  }
   let poster: string | undefined;
   if (storyboard.output?.poster) {
     poster = project.posterPath;
+    const at =
+      typeof storyboard.output.poster === "number"
+        ? storyboard.output.poster
+        : introMs + Math.max(500, blankOpenMs + 200);
     await runFfmpeg([
       "-ss",
-      ((introMs + 500) / 1000).toFixed(3),
+      (at / 1000).toFixed(3),
       "-i",
       project.outputPath,
       "-frames:v",
@@ -977,7 +1124,29 @@ export async function compose(
       "1",
       poster,
     ]);
-    log(`poster → ${poster}`);
+    log(`poster → ${poster} (@ ${stampMs(at)})`);
+  }
+  // Dump the queued warning frames (issue #59). Best-effort: a failed grab
+  // must never fail a compose that otherwise produced a video.
+  if (warningFrames.length) {
+    const dir = project.p("output", "warnings");
+    await ensureDir(dir);
+    for (const f of warningFrames) {
+      const png = resolve(dir, `${f.name}.png`);
+      await runFfmpeg([
+        "-y",
+        "-ss",
+        ((introMs + f.atMs) / 1000).toFixed(3),
+        "-i",
+        project.outputPath,
+        "-frames:v",
+        "1",
+        "-update",
+        "1",
+        png,
+      ]).catch(() => {});
+    }
+    log(`warning frames → ${relative(project.dir, dir)}/ (${warningFrames.length})`);
   }
   // AIDEMO_KEEP_TMP=1 keeps .compose-tmp for debugging intermediates.
   if (!process.env.AIDEMO_KEEP_TMP) {
@@ -993,6 +1162,7 @@ export async function compose(
     captions: { cues: captionsResult.cues, passes: captionsResult.passes },
     hold: hold.mode,
     ...(poster ? { poster } : {}),
+    blankOpenMs: Math.round(blankOpenMs),
     ...(attentionPlaced.length || keysPlaced.length || clicksPlaced.length || redactPlaced.length
       ? {
           attention: {
@@ -1013,8 +1183,18 @@ export async function compose(
       (frozen ? ` (${frozen} of ${sceneReports.length} scene(s) mostly held)` : "")
   );
   if (warnings.length) {
+    // Last thing on screen, grouped by scene (issue #59): in a 28-scene render
+    // an ungrouped list scrolls away above the ✓ lines and is never read.
     log(`⚠ ${warnings.length} compose warning(s):`);
-    for (const w of warnings) log(`  - [${w.code}] ${w.message}`);
+    const byScene = new Map<string, ComposeWarning[]>();
+    for (const w of warnings) {
+      const k = w.scene ?? "(whole video)";
+      byScene.set(k, [...(byScene.get(k) ?? []), w]);
+    }
+    for (const [scene, list] of byScene) {
+      log(`  ${scene}:`);
+      for (const w of list) log(`    - [${w.code}] ${w.message}`);
+    }
   }
   return report;
 }
@@ -1171,12 +1351,96 @@ async function concatSegments(
  * padded). Net effect: identical A/V duration + alignment as hard cuts, but the
  * boundaries cross-dissolve. Re-encodes (xfade needs filter_complex).
  */
+/**
+ * Does the boundary between these two scenes cross a page navigation? Either
+ * the next scene opens with a load (its first idle span is the `goto` wait) or
+ * the previous scene's last action was a navigation. Both are already in the
+ * timeline, so no extra probing is needed.
+ */
+/**
+ * Per-scene address-pill text for `frame.url: "auto"`: the host of the URL the
+ * scene is on, carried forward from the last `goto` (falling back to
+ * `baseUrl`). Consecutive scenes on the same host share one span.
+ */
+function frameUrlSpans(
+  scenes: Timeline["scenes"],
+  spans: Array<{ a: number; b: number }>
+): Array<{ a: number; b: number; label: string }> {
+  let current = "";
+  const out: Array<{ a: number; b: number; label: string }> = [];
+  for (let i = 0; i < scenes.length; i++) {
+    for (const a of scenes[i].actions ?? []) {
+      if (a.op === "goto" && a.target) current = prettyHost(a.target) || current;
+    }
+    const span = spans[i];
+    if (!span) continue;
+    const last = out.at(-1);
+    if (last && last.label === current) last.b = span.b;
+    else out.push({ a: i === 0 ? 0 : span.a, b: span.b, label: current });
+  }
+  if (out.length) out[out.length - 1].b += 3600_000; // cover holds/cards past the last scene
+  return out;
+}
+
+function prettyHost(url?: string): string {
+  if (!url) return "";
+  try {
+    const u = new URL(url, "http://localhost");
+    if (u.protocol !== "http:" && u.protocol !== "https:") return "";
+    return u.host.replace(/^www\./, "") + (u.pathname !== "/" ? u.pathname : "");
+  } catch {
+    return "";
+  }
+}
+
+function crossesNavigation(
+  prev: Timeline["scenes"][number],
+  next: Timeline["scenes"][number]
+): boolean {
+  const opensOnLoad = (next.idleSpans ?? []).some(
+    (sp) => sp.label === "load" && sp.startMs - next.startMs < 1500
+  );
+  if (opensOnLoad) return true;
+  const lastOp = (prev.actions ?? []).filter((a) => !a.skipped).at(-1)?.op;
+  const firstOp = (next.actions ?? [])[0]?.op;
+  return lastOp === "goto" || lastOp === "back" || firstOp === "goto" || firstOp === "back";
+}
+
 async function crossfadeScenes(
   sceneVideos: string[],
-  durationMs: number,
-  outPath: string
+  durationsMs: number[],
+  outPath: string,
+  tmp: string
 ): Promise<string> {
-  const D = Math.max(0.05, durationMs / 1000);
+  // Hard-cut boundaries split the run into groups: each group is crossfaded on
+  // its own (duration is preserved inside a group) and the groups are then
+  // concatenated, which IS the hard cut.
+  if (durationsMs.some((d) => d <= 0)) {
+    const groups: string[][] = [[sceneVideos[0]]];
+    const groupDurs: number[][] = [[]];
+    for (let i = 1; i < sceneVideos.length; i++) {
+      if (durationsMs[i - 1] <= 0) {
+        groups.push([sceneVideos[i]]);
+        groupDurs.push([]);
+      } else {
+        groups[groups.length - 1].push(sceneVideos[i]);
+        groupDurs[groupDurs.length - 1].push(durationsMs[i - 1]);
+      }
+    }
+    const parts: string[] = [];
+    for (let g = 0; g < groups.length; g++) {
+      if (groups[g].length === 1) {
+        parts.push(groups[g][0]);
+        continue;
+      }
+      parts.push(
+        await crossfadeScenes(groups[g], groupDurs[g], resolve(tmp, `xfade-${g}.mp4`), tmp)
+      );
+    }
+    if (parts.length === 1) return parts[0];
+    return concatSegments(parts, outPath, tmp, "xfade-groups", true);
+  }
+  const D = Math.max(0.05, Math.max(...durationsMs) / 1000);
   // Measure each segment so the offsets track real (not assumed) durations.
   const durs = await Promise.all(sceneVideos.map((p) => probeDurationMs(p)));
   // Freeze-tail margin: a touch longer than D so the fade never starves at the
@@ -1205,8 +1469,9 @@ async function crossfadeScenes(
     cumMs += durs[i - 1];
     const offset = (cumMs / 1000).toFixed(3);
     const out = i === sceneVideos.length - 1 ? "xout" : `x${i}`;
+    const d = Math.max(0.05, durationsMs[i - 1] / 1000);
     filters.push(
-      `[${prev}][${labels[i]}]xfade=transition=fade:duration=${D.toFixed(
+      `[${prev}][${labels[i]}]xfade=transition=fade:duration=${d.toFixed(
         3
       )}:offset=${offset}[${out}]`
     );
@@ -1362,11 +1627,29 @@ function sceneAutoIdle(
   const EDGE_MS = 300;
   const lo = tl.startMs + leadInMs + EDGE_MS;
   const hi = tl.endMs + leadInMs - EDGE_MS;
+  // Windows the author explicitly asked to be ON SCREEN: an attention overlay
+  // and its hold, a deliberate `focus`, a named still. A static confirmation
+  // card is motionless by nature, so freezedetect happily proposes trimming
+  // exactly the beat the scene exists for — and compose then holds the NEXT
+  // page's frame under that scene's narration (issue #55).
+  const protectedWindows: Array<[number, number]> = [
+    ...(tl.attentionEvents ?? []).map(
+      (e): [number, number] => [e.tMs + leadInMs, e.tMs + e.holdMs + leadInMs]
+    ),
+    ...(tl.focusEvents ?? [])
+      .filter((e) => e.kind === "focus")
+      .map((e): [number, number] => [e.tMs + leadInMs, e.tMs + (e.holdMs ?? 1200) + leadInMs]),
+    ...(tl.stillEvents ?? []).map(
+      (e): [number, number] => [e.tMs + leadInMs - 200, e.tMs + leadInMs + 200]
+    ),
+  ];
   const out: IdleSpan[] = [];
   for (const f of freezes) {
     const a = Math.max(f.startMs, lo);
     const b = Math.min(f.endMs, hi);
-    if (b - a > 200) out.push({ startMs: a - leadInMs, endMs: b - leadInMs, label: "auto-idle" });
+    if (b - a <= 200) continue;
+    if (protectedWindows.some(([pa, pb]) => pa < b && pb > a)) continue;
+    out.push({ startMs: a - leadInMs, endMs: b - leadInMs, label: "auto-idle" });
   }
   return out;
 }
@@ -1423,6 +1706,24 @@ function offsetInKeeps(keeps: Array<[number, number]>, t: number): number {
     off += b - a;
   }
   return off;
+}
+
+/** Inverse of `offsetInKeeps`: kept-span offset → raw video ms. */
+function rawAtKeepOffset(keeps: Array<[number, number]>, local: number): number {
+  let off = 0;
+  for (const [a, b] of keeps) {
+    const len = b - a;
+    if (local <= off + len) return a + (local - off);
+    off += len;
+  }
+  return keeps.length ? keeps[keeps.length - 1][1] : 0;
+}
+
+/** mm:ss.t for a ms offset, for log lines that point back into the raw take. */
+function stampMs(ms: number): string {
+  const s = Math.max(0, ms) / 1000;
+  const m = Math.floor(s / 60);
+  return `${m}:${(s - m * 60).toFixed(1).padStart(4, "0")}`;
 }
 
 /** Extract each keep span from raw and concat into one mp4 (uniform h264). */
@@ -1659,13 +1960,16 @@ async function burnCaptions(
  */
 /** Output sizing with a preset's defaults filled in (explicit keys win). */
 function resolveOutputSizing(output: Output | undefined): Output {
-  if (!output) return { fit: "contain" };
+  if (!output) return {};
   const p = output.preset ? OUTPUT_PRESETS[output.preset] : null;
   return {
     ...output,
     width: output.width ?? p?.width,
     height: output.height ?? p?.height,
-    fit: output.width != null ? output.fit : (p?.fit ?? output.fit),
+    // An explicit fit wins over the preset's (issue #58): `preset: "youtube"`
+    // + `fit: "cover"` is how you get an edge-to-edge 16:9 cut from a 16:10
+    // capture, and before this the preset silently forced "contain".
+    fit: output.fit ?? p?.fit ?? "contain",
   };
 }
 

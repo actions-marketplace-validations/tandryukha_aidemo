@@ -11,6 +11,7 @@ import {
   VoiceManifestSchema,
   CaptionsManifestSchema,
   type CaptionsManifest,
+  type CaptionsConfig,
   type Storyboard,
 } from "./types.js";
 import { resolveNarrationLanguage } from "./i18n.js";
@@ -38,8 +39,52 @@ interface Word {
   end: number; // seconds
 }
 
-const MAX_WORDS = 6;
-const MAX_CUE_MS = 3000;
+/**
+ * Cue-segmentation defaults (issue #48). The old 6-word / 3 s hard cap split
+ * half of all cue breaks mid-clause ("…nobody has / filled in a form, and no /
+ * account exists yet"), which is harder to read than the narration. Broadcast
+ * practice is ~2 lines x ~37 characters, 1–6 s per cue, broken at punctuation
+ * or a conjunction. Override per storyboard via the `captions` block.
+ */
+const DEFAULT_SEG: Required<
+  Pick<CaptionsConfig, "maxWords" | "maxCueMs" | "minCueMs" | "maxLines" | "maxCharsPerLine">
+> = {
+  maxWords: 12,
+  maxCueMs: 6000,
+  minCueMs: 1000,
+  maxLines: 2,
+  maxCharsPerLine: 38,
+};
+
+/** Conjunctions/discourse markers that make a decent break point, by language. */
+const CONJUNCTIONS = new Set([
+  // en
+  "and", "but", "so", "or", "then", "because", "while", "when", "which", "that", "if",
+  // et
+  "ja", "aga", "või", "siis", "kui", "sest", "mis", "ning", "kuid",
+  // de / nl / sv
+  "und", "aber", "oder", "dann", "weil", "wenn", "och", "men", "eller", "en", "maar",
+  // fr / es / it / pt
+  "et", "mais", "ou", "donc", "parce", "quand", "y", "pero", "o", "entonces", "porque",
+  "e", "ma", "oppure", "quindi", "perché", "mas", "então",
+]);
+
+type SegConfig = typeof DEFAULT_SEG;
+
+function segConfig(storyboard?: Storyboard): SegConfig {
+  return { ...DEFAULT_SEG, ...cleanSeg(storyboard?.captions) };
+}
+
+function cleanSeg(c: CaptionsConfig | undefined): Partial<SegConfig> {
+  if (!c) return {};
+  const out: Partial<SegConfig> = {};
+  if (c.maxWords != null) out.maxWords = c.maxWords;
+  if (c.maxCueMs != null) out.maxCueMs = c.maxCueMs;
+  if (c.minCueMs != null) out.minCueMs = c.minCueMs;
+  if (c.maxLines != null) out.maxLines = c.maxLines;
+  if (c.maxCharsPerLine != null) out.maxCharsPerLine = c.maxCharsPerLine;
+  return out;
+}
 
 /** Whisper's `prompt` is only used to bias roughly its first ~224 tokens of
  *  context; cap what we send so a long demo's script doesn't balloon the
@@ -93,7 +138,8 @@ export async function generateCaptions(
     for (let i = 0; i < total; i++) opts.onSceneComplete?.(ids[i] ?? "", i, total);
   };
   if (total > 0) opts.onSceneStart?.(ids[0] ?? "", 0, total);
-  const config = captionConfig(await loadGapMs(project));
+  const seg = segConfig(storyboard);
+  const config = captionConfig(await loadGapMs(project), seg);
 
   const prompt = storyboard ? buildSttPrompt(storyboard) : undefined;
   const language = opts.language ?? resolveNarrationLanguage(storyboard, project.lang);
@@ -151,7 +197,7 @@ export async function generateCaptions(
   if (words.length === 0) {
     log("no word timestamps returned; captions may be empty");
   }
-  const cues = groupWords(words, sceneEnds);
+  const cues = groupWords(words, sceneEnds, seg);
   await writeCaptionFiles(project, cues);
   await writeCaptionsManifest(project, {
     mode: "stt",
@@ -252,7 +298,8 @@ export async function generateCaptionsOffline(
     await readJson(project.voiceManifestPath)
   );
   const durById = new Map(voice.scenes.map((s) => [s.id, s.durationMs]));
-  const config = captionConfig(voice.gapMs);
+  const seg = segConfig(storyboard);
+  const config = captionConfig(voice.gapMs, seg);
 
   // Per-scene caption identity = narration + this scene's measured duration (+
   // grouping config). The scene-relative word timings depend on nothing else, so
@@ -333,7 +380,7 @@ export async function generateCaptionsOffline(
     cursor += voice.gapMs;
   }
 
-  const cues = groupWords(words, sceneEnds);
+  const cues = groupWords(words, sceneEnds, seg);
   await writeCaptionFiles(project, cues);
   await writeCaptionsManifest(project, {
     mode: "offline",
@@ -369,6 +416,12 @@ async function writeCaptionFiles(project: Project, cues: Cue[]): Promise<void> {
   await fs.writeFile(project.captionsSrtPath, toSrt(cues));
   await fs.writeFile(project.captionsVttPath, toVtt(cues));
   await writeJson(project.captionsCuesPath, cues);
+  // Readability, so an agent sees it without opening the SRT (issue #48).
+  const stats = cueStats(cues);
+  log(
+    `cues: ${cues.length}, ${stats.midClausePct}% mid-clause breaks, ` +
+      `${stats.short} shorter than 1s`
+  );
   ok(`captions → ${project.captionsSrtPath} (${cues.length} cues)`);
   ok(`captions → ${project.captionsCuesPath}`);
 }
@@ -381,8 +434,8 @@ async function writeCaptionFiles(project: Project, cues: Cue[]): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /** Grouping parameters that affect cue segmentation — part of the cache key. */
-function captionConfig(gapMs: number): CaptionsManifest["config"] {
-  return { gapMs, maxWords: MAX_WORDS, maxCueMs: MAX_CUE_MS };
+function captionConfig(gapMs: number, cfg: SegConfig = DEFAULT_SEG): CaptionsManifest["config"] {
+  return { gapMs, maxWords: cfg.maxWords, maxCueMs: cfg.maxCueMs };
 }
 
 /** Inter-scene gap from voice.json (0 when absent — captions need voice.json). */
@@ -451,38 +504,129 @@ async function sceneIdsFor(project: Project): Promise<string[]> {
   return voice.success ? voice.data.scenes.map((s) => s.id) : [];
 }
 
-function groupWords(words: Word[], sceneEnds: number[]): Cue[] {
-  const cues: Cue[] = [];
+/** Text of a run of words, with punctuation re-attached. */
+function cueText(ws: Word[]): string {
+  // trim each word: faster-whisper servers pad words with leading spaces
+  return ws
+    .map((w) => w.word.trim())
+    .join(" ")
+    .replace(/\s+([,.!?;:])/g, "$1")
+    .trim();
+}
+
+/** A word that ends a clause (punctuation) — the best place to break. */
+function endsClause(w: Word): boolean {
+  return /[,;:—–]$/.test(w.word.trim());
+}
+
+function endsSentence(w: Word): boolean {
+  return /[.!?]["'”’)]?$/.test(w.word.trim());
+}
+
+/**
+ * Split a run of words into cues at the most readable boundaries: sentence
+ * ends first, then clause punctuation, then a conjunction, and only then on
+ * pure length. Never leaves a 2–3 word tail dangling when the previous
+ * boundary can absorb it.
+ */
+function splitRun(ws: Word[], cfg: SegConfig): Word[][] {
+  const capChars = cfg.maxLines * cfg.maxCharsPerLine;
+  const fits = (run: Word[]): boolean =>
+    run.length <= cfg.maxWords &&
+    cueText(run).length <= capChars &&
+    (run[run.length - 1].end - run[0].start) * 1000 <= cfg.maxCueMs;
+  if (ws.length === 0) return [];
+  if (fits(ws)) return [ws];
+  // The furthest index that still fits, then walk back to a real boundary.
+  let end = 1;
+  while (end < ws.length && fits(ws.slice(0, end + 1))) end++;
+  const floor = Math.max(1, Math.ceil(end * 0.45));
+  let cut = end;
+  for (let i = end - 1; i >= floor; i--) {
+    if (endsSentence(ws[i]) || endsClause(ws[i])) {
+      cut = i + 1;
+      break;
+    }
+  }
+  if (cut === end) {
+    for (let i = end - 1; i >= floor; i--) {
+      const next = ws[i + 1];
+      if (next && CONJUNCTIONS.has(next.word.trim().toLowerCase().replace(/[^\p{L}]/gu, ""))) {
+        cut = i + 1;
+        break;
+      }
+    }
+  }
+  return [ws.slice(0, cut), ...splitRun(ws.slice(cut), cfg)];
+}
+
+/** Merge a too-short cue into the neighbour it still fits in. */
+function mergeShort(runs: Word[][], cfg: SegConfig): Word[][] {
+  const capChars = cfg.maxLines * cfg.maxCharsPerLine;
+  const room = (a: Word[], b: Word[]): boolean =>
+    a.length + b.length <= cfg.maxWords &&
+    cueText([...a, ...b]).length <= capChars &&
+    (b[b.length - 1].end - a[0].start) * 1000 <= cfg.maxCueMs;
+  const out: Word[][] = [];
+  for (const run of runs) {
+    const durMs = (run[run.length - 1].end - run[0].start) * 1000;
+    const prev = out[out.length - 1];
+    if (durMs < cfg.minCueMs && prev && room(prev, run)) {
+      out[out.length - 1] = [...prev, ...run];
+      continue;
+    }
+    out.push(run);
+  }
+  return out;
+}
+
+function groupWords(words: Word[], sceneEnds: number[], cfg: SegConfig = DEFAULT_SEG): Cue[] {
+  // Scene boundaries and sentence ends are hard breaks; inside those runs the
+  // split is clause-aware.
+  const runs: Word[][] = [];
   let cur: Word[] = [];
   let sceneIdx = 0;
-  const flush = () => {
-    if (cur.length === 0) return;
-    cues.push({
-      index: cues.length + 1,
-      startMs: Math.round(cur[0].start * 1000),
-      endMs: Math.round(cur[cur.length - 1].end * 1000),
-      // trim each word: faster-whisper servers pad words with leading spaces
-      text: cur.map((w) => w.word.trim()).join(" ").replace(/\s+([,.!?])/g, "$1").trim(),
-    });
+  const cut = (): void => {
+    if (cur.length) runs.push(cur);
     cur = [];
   };
   for (const w of words) {
     const startMs = w.start * 1000;
-    // Crossed into a later scene? Break the cue there.
-    while (
-      sceneIdx < sceneEnds.length - 1 &&
-      startMs >= sceneEnds[sceneIdx]
-    ) {
-      flush();
+    while (sceneIdx < sceneEnds.length - 1 && startMs >= sceneEnds[sceneIdx]) {
+      cut();
       sceneIdx++;
     }
     cur.push(w);
-    const durMs = (w.end - cur[0].start) * 1000;
-    const endsSentence = /[.!?]$/.test(w.word.trim());
-    if (cur.length >= MAX_WORDS || durMs >= MAX_CUE_MS || endsSentence) flush();
+    if (endsSentence(w)) cut();
   }
-  flush();
-  return cues;
+  cut();
+  const split = runs.flatMap((r) => splitRun(r, cfg));
+  return mergeShort(split, cfg).map((ws, i) => ({
+    index: i + 1,
+    startMs: Math.round(ws[0].start * 1000),
+    endMs: Math.round(ws[ws.length - 1].end * 1000),
+    text: cueText(ws),
+  }));
+}
+
+/** Readability stats for the log: mid-clause breaks and too-short cues. */
+export function cueStats(cues: Cue[], minCueMs = DEFAULT_SEG.minCueMs): {
+  short: number;
+  midClause: number;
+  midClausePct: number;
+} {
+  let short = 0;
+  let midClause = 0;
+  cues.forEach((c, i) => {
+    if (c.endMs - c.startMs < minCueMs) short++;
+    const next = cues[i + 1];
+    if (!next) return;
+    const cleanBreak = /[.!?,;:—–]["'”’)]?$/.test(c.text.trim());
+    const startsLower = /^\p{Ll}/u.test(next.text.trim());
+    if (!cleanBreak && startsLower) midClause++;
+  });
+  const breaks = Math.max(1, cues.length - 1);
+  return { short, midClause, midClausePct: Math.round((midClause / breaks) * 100) };
 }
 
 function toSrt(cues: Cue[]): string {

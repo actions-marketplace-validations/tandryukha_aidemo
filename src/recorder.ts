@@ -192,6 +192,23 @@ export async function record(
   if (profileWarning && !seededOnPurpose) log(`  ! ${profileWarning}`);
 
   const { width, height } = storyboard.video;
+  // Raw-video density (issue #51). The page always lays out at width x height
+  // CSS px; `deviceScaleFactor` only decides how many real pixels each of them
+  // gets in the recording. Chrome itself has always rendered at 2x for
+  // crispness, so 1 (the default) keeps the old, unchanged output size.
+  const videoScale = storyboard.video.deviceScaleFactor ?? 1;
+  const dsf = Math.max(2, videoScale);
+  if (videoScale > 1) {
+    log(
+      `video: ${width}x${height} CSS px recorded at ${width * videoScale}x${height * videoScale} ` +
+        `(deviceScaleFactor ${videoScale})`
+    );
+    if (external) {
+      log(
+        `  ! --capture ${mode} records real screen pixels — video.deviceScaleFactor is ignored`
+      );
+    }
+  }
   const videoDir = dirname(project.rawVideoPath);
   log(`viewport: ${width}x${height}`);
   if (external) log(`capture mode: ${mode}`);
@@ -240,7 +257,8 @@ export async function record(
             );
           } else {
             throw new Error(
-              `--from-scene: scene "${sc.id}" changed since the previous take (actions, hide, redact, viewport, cursor mode, setup or params) — resume from "${sc.id}" or earlier`
+              `--from-scene: scene "${sc.id}" changed since the previous take (actions, hide, redact, viewport, cursor mode, setup or params) — resume from "${sc.id}" or earlier. ` +
+                `A rewritten \`goto\` URL counts: a single-use magic link or a rotated token in an earlier scene changes its hash even though nothing else moved.`
             );
           }
         }
@@ -316,10 +334,13 @@ export async function record(
         ? { viewport: null }
         : {
             viewport: { width, height },
-            deviceScaleFactor: 2,
+            deviceScaleFactor: dsf,
             recordVideo: {
               dir: dirname(project.rawVideoPath),
-              size: { width, height },
+              // `deviceScaleFactor: n` records n x the CSS viewport, so the
+              // product reads at output size (issue #51); the default 1x path
+              // still writes exactly width x height.
+              size: { width: width * videoScale, height: height * videoScale },
             },
           }),
     });
@@ -392,6 +413,22 @@ export async function record(
 
   const t0 = Date.now();
   let salvageTailMs = 0;
+  let builtinTailMs = 0;
+  // Ctrl-C / SIGTERM on a stuck take used to lose everything — the process
+  // died before the timeline was written, so there was nothing to resume from
+  // (issue #55). Fold the signals into the abort signal the player polls, so
+  // an interrupted take takes the salvage path and writes what it has.
+  const interrupt = new AbortController();
+  const onSignal = (sig: NodeJS.Signals): void => {
+    if (interrupt.signal.aborted) return;
+    log(`\n${sig} — stopping the take and salvaging the scenes recorded so far`);
+    interrupt.abort();
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, interrupt.signal])
+    : interrupt.signal;
   const logsDir = project.p("logs");
   const doneScenes: TimelineScene[] = [];
   let timeline: Timeline;
@@ -404,7 +441,7 @@ export async function record(
       t0,
       video: { width, height },
       logsDir,
-      signal: options.signal,
+      signal,
       probe: options.probe,
       captureCursorPath: composeCursor,
       baseDir: project.dir,
@@ -460,7 +497,12 @@ export async function record(
     }
   } finally {
     if (capture && !capFile) await capture.stop().catch(() => {});
-    // For built-in capture, closing the context finalizes the video file.
+    // For built-in capture, closing the context finalizes the video file —
+    // and the recorder keeps taking frames until then. Everything after the
+    // last scene's end is TAIL, not front lead-in: attributing it to the
+    // lead-in shifts every scene's window later by that much, so a reused
+    // scene's window ran on into the next scene's navigation (issue #55).
+    builtinTailMs = Math.max(0, Date.now() - (t0 + timeline!.totalMs));
     await context.close();
   }
 
@@ -528,10 +570,14 @@ export async function record(
     // The front lead-in (about:blank + launch) = actual video length minus the
     // measured content span. This is more reliable than timing the launch.
     const videoMs = await probeDurationMs(project.rawVideoPath);
-    timeline.leadInMs = Math.max(0, videoMs - timeline.totalMs - salvageTailMs);
+    // salvageTailMs (the failed scene's footage) is part of builtinTailMs —
+    // both are measured from the last COMPLETED scene's end — so take the
+    // larger of the two rather than subtracting twice.
+    const tail = Math.max(builtinTailMs, salvageTailMs);
+    timeline.leadInMs = Math.max(0, videoMs - timeline.totalMs - tail);
     await writeJson(project.timelinePath, timeline);
     log(
-      `video ${videoMs}ms, content ${timeline.totalMs}ms${salvageTailMs ? `, failed-scene tail ${salvageTailMs}ms` : ""} → lead-in ${timeline.leadInMs}ms`
+      `video ${videoMs}ms, content ${timeline.totalMs}ms, tail ${tail}ms${salvageTailMs ? ` (failed-scene footage ${salvageTailMs}ms)` : ""} → lead-in ${timeline.leadInMs}ms`
     );
     ok(`recording → ${project.rawVideoPath}`);
     finalized = true;
@@ -556,6 +602,8 @@ export async function record(
       if (KEEP_RE.test(f) && !referenced.has(p)) await fs.rm(p, { force: true });
     }
   }
+  process.off("SIGINT", onSignal);
+  process.off("SIGTERM", onSignal);
   if (recordErr) {
     log(
       `salvaged ${doneScenes.length}/${storyboard.scenes.length} scene(s) before failure; ` +

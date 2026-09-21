@@ -4,7 +4,7 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { ENGINE_ROOT, engineVersion, captionsAutoOffline } from "../config.js";
+import { ENGINE_ROOT, engineVersion, captionsAutoOffline, chromeProfileDir } from "../config.js";
 import { Project, parseStoryboard } from "../project.js";
 import { StoryboardSchema, SeedCookieSchema, type SeedCookie, type Storyboard } from "../types.js";
 import { generateVoice } from "../voice.js";
@@ -23,7 +23,9 @@ import { exportGif } from "../gif.js";
 import { buildEmbed } from "../embed.js";
 import { extractStills, storyboardHasStills } from "../stills.js";
 import { extractFrames } from "../frames.js";
+import { runQa, logQa } from "../qa.js";
 import { inspectPage } from "../inspect.js";
+import { collectSeeds, runPreflight } from "../setup.js";
 import { importTrace, scaffoldImported } from "../import-trace.js";
 import { exportWalkthrough } from "../walkthrough.js";
 import { GUIDE_TOPIC_NAMES, guideHeadings, guidePath as guideFilePath, sliceGuide } from "../guide.js";
@@ -1079,7 +1081,11 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
           captionsSrt: lp.captionsSrtPath,
           report: lp.reportPath,
           durationMs: report.durationMs,
+          // warningCount lets an orchestrating agent gate on the render
+          // without parsing the warning list (issue #59).
+          warningCount: report.warnings.length,
           warnings: report.warnings,
+          ...(report.blankOpenMs ? { blankOpenMs: report.blankOpenMs } : {}),
         };
       })
   );
@@ -1168,8 +1174,34 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
           ...(gifPath ? { gif: gifPath } : {}),
           report: lp.reportPath,
           durationMs: report.durationMs,
+          // warningCount lets an orchestrating agent gate on the render
+          // without parsing the warning list (issue #59).
+          warningCount: report.warnings.length,
           warnings: report.warnings,
+          ...(report.blankOpenMs ? { blankOpenMs: report.blankOpenMs } : {}),
         };
+      })
+  );
+
+  registerJob(
+    "qa",
+    "Post-render checks on the FINISHED MP4 — blank opening, blank poster, " +
+      "master loudness, music-bed level, per-scene hold shares + compose " +
+      "warnings, caption readability, frame/chapter hygiene. Run it after " +
+      "compose/render: it sees what a viewer sees, which neither lint (pre-take) " +
+      "nor report.json (structural) can.",
+    {
+      dir: DIR_INPUT,
+      params: PARAMS_INPUT,
+      lang: LANG_INPUT,
+    },
+    (project, args) => async (job) =>
+      jobs.runStage(job, "qa", async () => {
+        const storyboard = await project.loadStoryboard({ params: args.params });
+        const sb = args.lang ? localizeStoryboard(storyboard, args.lang) : storyboard;
+        const res = await runQa(langProject(project, args.lang), sb);
+        logQa(res);
+        return res;
       })
   );
 
@@ -1295,18 +1327,50 @@ export function buildMcpServer(): { server: McpServer; jobs: JobManager } {
         .record(z.string(), z.string())
         .optional()
         .describe("iframe selectors to scan too, as in the storyboard `frames` block"),
+      useSetup: z
+        .boolean()
+        .optional()
+        .describe(
+          "honour the storyboard's setup block (storageState/cookies/preflight) so an " +
+            "authenticated page can be scanned. Default true."
+        ),
+      storageState: z
+        .string()
+        .optional()
+        .describe("extra Playwright storageState JSON to seed before the scan"),
     },
     (project, args) => async (job) =>
       jobs.runStage(job, "inspect", async () => {
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
         const png = project.p("logs", `inspect-${stamp}.png`);
+        // #53: scan authenticated pages — same seeding surface as probe/record.
+        let storyboard: Storyboard | null = null;
+        if (args.useSetup !== false) {
+          storyboard = await project.loadStoryboard({ relaxed: true }).catch(() => null);
+        }
+        if (storyboard?.setup?.preflight) {
+          await runPreflight(storyboard.setup.preflight, {
+            demoDir: project.dir,
+            storyboardPath: project.storyboardPath,
+            profileDir: args.profile ?? chromeProfileDir(),
+          });
+          storyboard = await project
+            .loadStoryboard({ relaxed: true })
+            .catch(() => storyboard);
+        }
+        const seeds = await collectSeeds(
+          project.dir,
+          storyboard ?? ({ setup: undefined } as never),
+          { storageState: args.storageState }
+        );
         const res = await inspectPage({
           url: args.url,
           headless: args.headless !== false,
           profileDir: args.profile,
           limit: args.limit,
-          viewport: args.viewport,
-          frames: args.frames,
+          viewport: args.viewport ?? storyboard?.video,
+          frames: args.frames ?? storyboard?.frames,
+          seeds,
           screenshotPath: png,
         });
         const file = project.p("logs", `inspect-${stamp}.json`);

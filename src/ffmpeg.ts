@@ -171,6 +171,74 @@ export function probeFlatTailMs(
   });
 }
 
+/**
+ * Mirror of `probeFlatTailMs` for the HEAD of a file: how many ms at the start
+ * are a flat, contentless frame (the browser's white pre-paint after a `goto`).
+ * Used to open the video on the product instead of on a blank page, and to pick
+ * a poster frame that isn't a white rectangle (issue #47). Best-effort: any
+ * probe failure resolves to 0.
+ */
+export function probeFlatLeadMs(
+  file: string,
+  windowMs = 4000,
+  startMs = 0
+): Promise<number> {
+  return new Promise((resolvePromise) => {
+    const proc = spawn(
+      "ffmpeg",
+      [
+        "-hide_banner",
+        "-nostats",
+        ...(startMs > 0 ? ["-ss", (startMs / 1000).toFixed(3)] : []),
+        "-i",
+        file,
+        "-t",
+        (windowMs / 1000).toFixed(3),
+        "-vf",
+        "signalstats,metadata=print:file=-",
+        "-f",
+        "null",
+        "-",
+      ],
+      { stdio: ["ignore", "pipe", "ignore"] }
+    );
+    let out = "";
+    proc.stdout.on("data", (d) => (out += d.toString()));
+    proc.on("error", () => resolvePromise(0));
+    proc.on("close", () => {
+      const frames: Array<{ t: number; spread: number }> = [];
+      let t = NaN;
+      let low = NaN;
+      let high = NaN;
+      const flush = (): void => {
+        if (!Number.isNaN(t) && !Number.isNaN(low) && !Number.isNaN(high)) {
+          frames.push({ t, spread: high - low });
+        }
+        low = NaN;
+        high = NaN;
+      };
+      for (const line of out.split("\n")) {
+        const ts = /pts_time:\s*([\d.]+)/.exec(line);
+        if (ts) {
+          flush();
+          t = parseFloat(ts[1]);
+          continue;
+        }
+        const lo = /YLOW=\s*([\d.]+)/.exec(line);
+        if (lo) low = parseFloat(lo[1]);
+        const hi = /YHIGH=\s*([\d.]+)/.exec(line);
+        if (hi) high = parseFloat(hi[1]);
+      }
+      flush();
+      const FLAT_SPREAD = 4;
+      if (!frames.length || frames[0].spread > FLAT_SPREAD) return resolvePromise(0);
+      let i = 0;
+      while (i + 1 < frames.length && frames[i + 1].spread <= FLAT_SPREAD) i++;
+      resolvePromise(Math.max(0, Math.round(frames[i].t * 1000)));
+    });
+  });
+}
+
 /** A motionless span found by `freezedetect`, in ms from the file's start. */
 export interface FreezeSpan {
   startMs: number;
