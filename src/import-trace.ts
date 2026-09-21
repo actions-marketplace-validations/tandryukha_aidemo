@@ -274,6 +274,17 @@ function stepsFromTrace(entries: Map<string, Buffer>, notes: string[]): Step[] {
   return steps;
 }
 
+/**
+ * Escape a literal for embedding inside a double-quoted selector value. The
+ * captured text still carries the spec's own source escapes, so unescape once
+ * first; then escape backslashes before quotes — escaping only `"` leaves a
+ * trailing `\` producing `"foo\"`, which swallows the closing quote and
+ * rewrites the selector.
+ */
+function q(v: string): string {
+  return v.replace(/\\(.)/g, "$1").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
 /** Tolerant line-based parse of a Playwright test file (page.* chains). */
 export function stepsFromTest(src: string, notes: string[]): Step[] {
   const steps: Step[] = [];
@@ -310,30 +321,30 @@ export function stepsFromTest(src: string, notes: string[]): Step[] {
       let part = "";
       switch (fn) {
         case "getByRole":
-          part = name ? `role=${arg}[name="${S(name, 1)}"${exact ? "" : "i"}]` : `role=${arg}`;
+          part = name ? `role=${arg}[name="${q(S(name, 1))}"${exact ? "" : "i"}]` : `role=${arg}`;
           break;
         case "getByTestId":
-          part = `[data-testid="${arg}"]`;
+          part = `[data-testid="${q(arg)}"]`;
           break;
         case "getByText":
-          part = exact ? `text="${arg}"` : `text=${arg}`;
+          part = exact ? `text="${q(arg)}"` : `text=${arg}`;
           break;
         case "getByLabel":
           // Same engine the trace importer emits: resolves to the control.
-          part = `internal:label="${arg.replace(/"/g, '\\"')}"${exact ? "s" : "i"}`;
+          part = `internal:label="${q(arg)}"${exact ? "s" : "i"}`;
           break;
         case "getByPlaceholder":
-          part = `[placeholder="${arg}"]`;
+          part = `[placeholder="${q(arg)}"]`;
           break;
         case "getByTitle":
-          part = `[title="${arg}"]`;
+          part = `[title="${q(arg)}"]`;
           break;
         case "getByAltText":
-          part = `[alt="${arg}"]`;
+          part = `[alt="${q(arg)}"]`;
           break;
         case "locator":
           part = arg;
-          if (hasText) part += `:has-text("${S(hasText, 1)}")`;
+          if (hasText) part += `:has-text("${q(S(hasText, 1))}")`;
           break;
         case "frameLocator":
           frameSel = arg;
@@ -426,7 +437,7 @@ export function stepsFromTest(src: string, notes: string[]): Step[] {
         if (attr && val && !regexArg) {
           steps.push({
             method: "assert",
-            selector: `${selector} >> :scope[${attr}="${val.replace(/"/g, '\\"')}"]`,
+            selector: `${selector} >> :scope[${attr}="${q(val)}"]`,
           });
         } else if (attr) {
           steps.push({ method: "assert", selector: `${selector} >> :scope[${attr}]` });
